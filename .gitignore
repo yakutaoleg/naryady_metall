@@ -1,0 +1,27 @@
+# Другие проекты (у каждого свой репозиторий)
+ClawdBot/
+Design_site/
+Nedvex Web App/
+Personal assistant/
+Workflow N8n - server/
+n8n-mcp/
+
+# Claude internal
+.claude/
+
+# Документы и прочее
+documents/
+*.csv
+
+# Temp files
+nul
+*_temp.json
+*_temp.py
+C*/
+
+# MCP artifacts
+*payload_parts*
+
+# OS
+.DS_Store
+Thumbs.db
