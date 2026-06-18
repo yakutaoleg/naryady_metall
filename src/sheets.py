@@ -62,3 +62,24 @@ def read_sheet(file_id: str, sheet_name: str) -> list[dict]:
             continue
         data.append(record)
     return data
+
+
+def update_task_status(file_id: str, sheet_name: str, row_num: int,
+                       status: str, comment: str = None, date_fact: str = None):
+    """Write status/comment/date_fact back to Google Sheets."""
+    from google.oauth2.service_account import Credentials as _Creds
+    scopes_rw = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive.readonly'
+    ]
+    creds = _Creds.from_service_account_file(config.GOOGLE_SA_KEY, scopes=scopes_rw)
+    gc = gspread.authorize(creds)
+    ss = gc.open_by_key(file_id)
+    ws = ss.worksheet(sheet_name)
+    sheet_row = row_num + 2  # row 1=margin, row 2=headers, row 3+=data
+    # Columns: L=STATUS(12), M=COMMENT(13), N=DATE_FACT(14) — 1-based
+    ws.update(values=[[status]], range_name=f'L{sheet_row}')
+    if comment is not None:
+        ws.update(values=[[comment]], range_name=f'M{sheet_row}')
+    if date_fact is not None:
+        ws.update(values=[[date_fact]], range_name=f'N{sheet_row}')

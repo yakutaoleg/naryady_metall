@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,10 +10,12 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 from src import config, db, logger as app_logger
+from src.sheets import update_task_status
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL))
 
 WAITING_BLOCK_COMMENT = 1
+TODAY = lambda: date.today().strftime('%d.%m.%Y')
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +33,7 @@ def get_worker(tg_username: str):
 
 def get_active_tasks(worker_name: str, specialization: str):
     return db.fetchall(
-        """SELECT id, project_name, sheet_name, position, element,
+        """SELECT id, project_name, sheet_name, file_id, row_num, position, element,
                   quantity, unit_weight, total_weight, payment_sum,
                   date_plan, priority, mandatory, status, drawing_link
            FROM work_orders
@@ -87,10 +90,15 @@ def mandatory_remaining(worker_name: str, specialization: str):
 # ---------------------------------------------------------------------------
 
 def main_menu_kb():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📋 Задачи в работу", callback_data="tasks"),
-        InlineKeyboardButton("✅ Выполнено сегодня", callback_data="done_today"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Задачи на сегодня", callback_data="tasks"),
+            InlineKeyboardButton("✅ Выполнено сегодня", callback_data="done_today"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Обновить", callback_data="menu"),
+        ],
+    ])
 
 
 def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
@@ -106,7 +114,6 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
         label = f"{prefix}{t['position']} — {t['element'] or ''} × {qty}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"task:{t['id']}")])
 
-    # Заблокированные — только текст, callback не делает ничего
     for t in blocked:
         label = f"🚫 {t['position']} — {t['element'] or ''} (заблок.)"
         buttons.append([InlineKeyboardButton(label, callback_data="blocked_info")])
@@ -148,7 +155,12 @@ def back_to_menu_kb():
 # ---------------------------------------------------------------------------
 
 async def show_menu(update: Update, worker_name: str, specialization: str, edit: bool = False):
-    text = f"👷 {worker_name}\n🔧 Специализация: {specialization}\n\nВыберите действие:"
+    text = (
+        f"👷 {worker_name}\n"
+        f"🔧 Специализация: {specialization}\n"
+        f"📅 Сегодня: {TODAY()}\n\n"
+        f"Выберите действие:"
+    )
     kb = main_menu_kb()
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=kb)
@@ -163,14 +175,16 @@ async def show_tasks(update: Update, worker_name: str, specialization: str):
     mandatory_left = mandatory_remaining(worker_name, specialization)
 
     if not tasks and not blocked:
-        text = "🎉 Все задачи выполнены! Новых задач нет."
-        await update.callback_query.edit_message_text(text, reply_markup=back_to_menu_kb())
+        await update.callback_query.edit_message_text(
+            f"🎉 Все задачи выполнены!\n📅 {TODAY()}",
+            reply_markup=back_to_menu_kb()
+        )
         return
 
     mandatory_tasks = [t for t in tasks if t['mandatory']]
     optional_tasks  = [t for t in tasks if not t['mandatory']]
 
-    lines = [f"📋 Задачи | {specialization}\n"]
+    lines = [f"📋 Задачи на сегодня | {specialization}", f"📅 {TODAY()}\n"]
 
     if mandatory_tasks:
         lines.append("❗ Обязательные:")
@@ -227,10 +241,10 @@ async def show_task_detail(update: Update, task: dict, specialization: str):
 async def show_done_today(update: Update, worker_name: str, specialization: str):
     tasks = get_done_today(worker_name, specialization)
     if not tasks:
-        text = "За сегодня выполненных задач нет."
+        text = f"За сегодня ({TODAY()}) выполненных задач нет."
     else:
         total = sum(float(t['payment_sum'] or 0) for t in tasks)
-        lines = [f"✅ Выполнено сегодня ({len(tasks)}):\n"]
+        lines = [f"✅ Выполнено сегодня ({TODAY()}) — {len(tasks)} шт:\n"]
         for t in tasks:
             pay = f"  |  {t['payment_sum']} руб" if t['payment_sum'] else ""
             lines.append(f"✅ {t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт{pay}")
@@ -291,23 +305,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Сессия устарела. Нажмите /start")
         return
 
-    # --- MENU ---
     if data == "menu":
         await show_menu(update, worker_name, specialization, edit=True)
 
-    # --- TASK LIST ---
     elif data == "tasks":
         await show_tasks(update, worker_name, specialization)
 
-    # --- DONE TODAY ---
     elif data == "done_today":
         await show_done_today(update, worker_name, specialization)
 
-    # --- BLOCKED INFO (tap on blocked task) ---
     elif data == "blocked_info":
         await query.answer("Задача заблокирована. Обратитесь к руководителю.", show_alert=True)
 
-    # --- TASK DETAIL ---
     elif data.startswith("task:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone("SELECT * FROM work_orders WHERE id=%s", [task_id])
@@ -328,29 +337,47 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         app_logger.audit('view_task', user.id, user.username, {'task_id': task_id}, 'success')
         await show_task_detail(update, task, specialization)
 
-    # --- MARK DONE ---
     elif data.startswith("done:"):
         task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, element, executor FROM work_orders WHERE id=%s", [task_id])
+        task = db.fetchone(
+            "SELECT position, element, payment_sum, executor, file_id, sheet_name, row_num FROM work_orders WHERE id=%s",
+            [task_id]
+        )
         if not task or task['executor'] != worker_name:
             await query.edit_message_text("Ошибка доступа.", reply_markup=back_to_tasks_kb())
             return
 
+        today_str = date.today().strftime('%d.%m.%Y')
+
+        # 1. Обновляем PostgreSQL
         db.execute(
             "UPDATE work_orders SET status='ВЫПОЛНЕНО', date_fact=CURRENT_DATE WHERE id=%s AND status='ПЛАН'",
             [task_id]
         )
+
+        # 2. Обновляем Google Sheets
+        try:
+            update_task_status(
+                file_id=task['file_id'],
+                sheet_name=task['sheet_name'],
+                row_num=task['row_num'],
+                status='ВЫПОЛНЕНО',
+                date_fact=today_str
+            )
+        except Exception as e:
+            app_logger.error(f"Sheets write error: {e}")
+
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # Удаляем карточку задачи, отправляем новое сообщение-подтверждение в историю
+        # 3. Удаляем карточку, в историю чата пишем новое сообщение
+        pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
         await query.delete_message()
         await context.bot.send_message(
             chat_id=user.id,
-            text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено!",
+            text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}",
             reply_markup=back_to_tasks_kb()
         )
 
-    # --- ASK BEFORE BLOCK ---
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
@@ -363,7 +390,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=confirm_block_kb(task_id)
         )
 
-    # --- CONFIRMED BLOCK → ASK COMMENT ---
     elif data.startswith("block_confirm:"):
         task_id = int(data.split(":")[1])
         context.user_data['block_task_id'] = task_id
@@ -382,20 +408,39 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Ошибка: начните заново с /start")
         return ConversationHandler.END
 
-    task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
+    task = db.fetchone(
+        "SELECT position, element, payment_sum, file_id, sheet_name, row_num FROM work_orders WHERE id=%s",
+        [task_id]
+    )
+
+    # 1. Обновляем PostgreSQL
     db.execute(
         "UPDATE work_orders SET status='БЛОК', comment=%s WHERE id=%s AND status='ПЛАН'",
         [comment, task_id]
     )
+
+    # 2. Обновляем Google Sheets
+    try:
+        update_task_status(
+            file_id=task['file_id'],
+            sheet_name=task['sheet_name'],
+            row_num=task['row_num'],
+            status='БЛОК',
+            comment=comment
+        )
+    except Exception as e:
+        app_logger.error(f"Sheets write error: {e}")
+
     app_logger.audit('set_block', user.id, user.username,
                      {'task_id': task_id, 'comment': comment}, 'success')
 
     pos = task['position'] if task else f"#{task_id}"
     el  = task['element'] if task else ''
+    pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task and task['payment_sum'] else ""
 
-    # Новое сообщение остаётся в истории чата
+    # 3. В историю чата — новое сообщение
     await update.message.reply_text(
-        f"🚫 {pos} — {el}\nЗаблокировано.\nПричина: {comment}",
+        f"🚫 {pos} — {el}\nЗаблокировано | {TODAY()}\nПричина: {comment}{pay}",
         reply_markup=back_to_tasks_kb()
     )
     return ConversationHandler.END
