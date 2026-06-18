@@ -169,16 +169,18 @@ async def show_menu(update: Update, worker_name: str, specialization: str, edit:
         await msg.reply_text(text, reply_markup=kb)
 
 
-async def show_tasks(update: Update, worker_name: str, specialization: str):
+async def show_tasks(update: Update, worker_name: str, specialization: str,
+                     bot=None, chat_id=None):
     tasks   = get_active_tasks(worker_name, specialization)
     blocked = get_blocked_tasks(worker_name, specialization)
     mandatory_left = mandatory_remaining(worker_name, specialization)
 
     if not tasks and not blocked:
-        await update.callback_query.edit_message_text(
-            f"🎉 Все задачи выполнены!\n📅 {TODAY()}",
-            reply_markup=back_to_menu_kb()
-        )
+        text = f"🎉 Все задачи выполнены!\n📅 {TODAY()}"
+        if bot and chat_id:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=back_to_menu_kb())
+        else:
+            await update.callback_query.edit_message_text(text, reply_markup=back_to_menu_kb())
         return
 
     mandatory_tasks = [t for t in tasks if t['mandatory']]
@@ -204,10 +206,12 @@ async def show_tasks(update: Update, worker_name: str, specialization: str):
             lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
 
     lines.append("\n👇 Нажмите на задачу:")
-    await update.callback_query.edit_message_text(
-        "\n".join(lines),
-        reply_markup=tasks_list_kb(tasks, blocked, mandatory_left)
-    )
+    tasks_text = "\n".join(lines)
+    tasks_kb   = tasks_list_kb(tasks, blocked, mandatory_left)
+    if bot and chat_id:
+        await bot.send_message(chat_id=chat_id, text=tasks_text, reply_markup=tasks_kb)
+    else:
+        await update.callback_query.edit_message_text(tasks_text, reply_markup=tasks_kb)
 
 
 async def show_task_detail(update: Update, task: dict, specialization: str):
@@ -369,14 +373,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # 3. Удаляем карточку, в историю чата пишем новое сообщение
+        # 3. Карточку редактируем → подтверждение БЕЗ кнопок (остаётся в истории навсегда)
         pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
-        await query.delete_message()
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}",
-            reply_markup=back_to_tasks_kb()
+        await query.edit_message_text(
+            f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}"
         )
+        # Список задач — отдельное новое сообщение ниже
+        await show_tasks(update, worker_name, specialization, bot=context.bot, chat_id=user.id)
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
