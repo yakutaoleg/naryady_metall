@@ -40,6 +40,16 @@ def get_active_tasks(worker_name: str, specialization: str):
     )
 
 
+def get_blocked_tasks(worker_name: str, specialization: str):
+    return db.fetchall(
+        """SELECT id, position, element, quantity, comment
+           FROM work_orders
+           WHERE executor=%s AND sheet_name=%s AND status='БЛОК'
+           ORDER BY position""",
+        [worker_name, specialization]
+    )
+
+
 def get_done_today(worker_name: str, specialization: str):
     return db.fetchall(
         """SELECT id, position, element, quantity, payment_sum
@@ -83,7 +93,7 @@ def main_menu_kb():
     ]])
 
 
-def tasks_list_kb(tasks: list, mandatory_left: list):
+def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     buttons = []
     for t in tasks:
         if t['mandatory']:
@@ -95,6 +105,12 @@ def tasks_list_kb(tasks: list, mandatory_left: list):
         qty = t['quantity'] or '?'
         label = f"{prefix}{t['position']} — {t['element'] or ''} × {qty}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"task:{t['id']}")])
+
+    # Заблокированные — только текст, callback не делает ничего
+    for t in blocked:
+        label = f"🚫 {t['position']} — {t['element'] or ''} (заблок.)"
+        buttons.append([InlineKeyboardButton(label, callback_data="blocked_info")])
+
     buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
     return InlineKeyboardMarkup(buttons)
 
@@ -102,9 +118,16 @@ def tasks_list_kb(tasks: list, mandatory_left: list):
 def task_detail_kb(task_id: int):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ ВЫПОЛНЕНО", callback_data=f"done:{task_id}"),
-        InlineKeyboardButton("🚫 БЛОК", callback_data=f"block:{task_id}"),
+        InlineKeyboardButton("🚫 БЛОК", callback_data=f"block_ask:{task_id}"),
     ], [
         InlineKeyboardButton("← К задачам", callback_data="tasks"),
+    ]])
+
+
+def confirm_block_kb(task_id: int):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, заблокировать", callback_data=f"block_confirm:{task_id}"),
+        InlineKeyboardButton("Отмена", callback_data=f"task:{task_id}"),
     ]])
 
 
@@ -135,13 +158,13 @@ async def show_menu(update: Update, worker_name: str, specialization: str, edit:
 
 
 async def show_tasks(update: Update, worker_name: str, specialization: str):
-    tasks = get_active_tasks(worker_name, specialization)
+    tasks   = get_active_tasks(worker_name, specialization)
+    blocked = get_blocked_tasks(worker_name, specialization)
     mandatory_left = mandatory_remaining(worker_name, specialization)
 
-    if not tasks:
+    if not tasks and not blocked:
         text = "🎉 Все задачи выполнены! Новых задач нет."
-        kb = back_to_menu_kb()
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
+        await update.callback_query.edit_message_text(text, reply_markup=back_to_menu_kb())
         return
 
     mandatory_tasks = [t for t in tasks if t['mandatory']]
@@ -160,10 +183,16 @@ async def show_tasks(update: Update, worker_name: str, specialization: str):
         for t in optional_tasks:
             lines.append(f"  • {t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
 
+    if blocked:
+        lines.append("\n🚫 Заблокированные (снимает руководитель):")
+        for t in blocked:
+            comment = f" — {t['comment']}" if t['comment'] else ""
+            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
+
     lines.append("\n👇 Нажмите на задачу:")
     await update.callback_query.edit_message_text(
         "\n".join(lines),
-        reply_markup=tasks_list_kb(tasks, mandatory_left)
+        reply_markup=tasks_list_kb(tasks, blocked, mandatory_left)
     )
 
 
@@ -237,7 +266,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return (worker_name, specialization) from context or DB."""
     worker_name    = context.user_data.get('worker_name')
     specialization = context.user_data.get('specialization')
     if not worker_name:
@@ -263,15 +291,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Сессия устарела. Нажмите /start")
         return
 
+    # --- MENU ---
     if data == "menu":
         await show_menu(update, worker_name, specialization, edit=True)
 
+    # --- TASK LIST ---
     elif data == "tasks":
         await show_tasks(update, worker_name, specialization)
 
+    # --- DONE TODAY ---
     elif data == "done_today":
         await show_done_today(update, worker_name, specialization)
 
+    # --- BLOCKED INFO (tap on blocked task) ---
+    elif data == "blocked_info":
+        await query.answer("Задача заблокирована. Обратитесь к руководителю.", show_alert=True)
+
+    # --- TASK DETAIL ---
     elif data.startswith("task:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone("SELECT * FROM work_orders WHERE id=%s", [task_id])
@@ -292,9 +328,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         app_logger.audit('view_task', user.id, user.username, {'task_id': task_id}, 'success')
         await show_task_detail(update, task, specialization)
 
+    # --- MARK DONE ---
     elif data.startswith("done:"):
         task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, executor FROM work_orders WHERE id=%s", [task_id])
+        task = db.fetchone("SELECT position, element, executor FROM work_orders WHERE id=%s", [task_id])
         if not task or task['executor'] != worker_name:
             await query.edit_message_text("Ошибка доступа.", reply_markup=back_to_tasks_kb())
             return
@@ -304,20 +341,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [task_id]
         )
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
-        await show_tasks(update, worker_name, specialization)
 
-    elif data.startswith("block:"):
+        # Удаляем карточку задачи, отправляем новое сообщение-подтверждение в историю
+        await query.delete_message()
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено!",
+            reply_markup=back_to_tasks_kb()
+        )
+
+    # --- ASK BEFORE BLOCK ---
+    elif data.startswith("block_ask:"):
+        task_id = int(data.split(":")[1])
+        task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
+        pos = task['position'] if task else f"#{task_id}"
+        el  = task['element'] if task else ''
+        await query.edit_message_text(
+            f"Вы уверены, что хотите заблокировать задачу?\n\n"
+            f"🚫 {pos} — {el}\n\n"
+            f"Снять блокировку сможет только руководитель.",
+            reply_markup=confirm_block_kb(task_id)
+        )
+
+    # --- CONFIRMED BLOCK → ASK COMMENT ---
+    elif data.startswith("block_confirm:"):
         task_id = int(data.split(":")[1])
         context.user_data['block_task_id'] = task_id
         await query.edit_message_text(
-            "🚫 БЛОК\n\nНапишите причину блокировки одним сообщением:"
+            "🚫 Укажите причину блокировки:\n(напишите ответным сообщением)"
         )
         return WAITING_BLOCK_COMMENT
 
 
 async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    worker_name, specialization = _get_worker_context(update, context)
     task_id = context.user_data.pop('block_task_id', None)
     comment = update.message.text.strip()
 
@@ -325,7 +382,7 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Ошибка: начните заново с /start")
         return ConversationHandler.END
 
-    task = db.fetchone("SELECT position FROM work_orders WHERE id=%s", [task_id])
+    task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
     db.execute(
         "UPDATE work_orders SET status='БЛОК', comment=%s WHERE id=%s AND status='ПЛАН'",
         [comment, task_id]
@@ -333,9 +390,12 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
     app_logger.audit('set_block', user.id, user.username,
                      {'task_id': task_id, 'comment': comment}, 'success')
 
-    position = task['position'] if task else f"#{task_id}"
+    pos = task['position'] if task else f"#{task_id}"
+    el  = task['element'] if task else ''
+
+    # Новое сообщение остаётся в истории чата
     await update.message.reply_text(
-        f"🚫 {position} — заблокировано.\nПричина сохранена.",
+        f"🚫 {pos} — {el}\nЗаблокировано.\nПричина: {comment}",
         reply_markup=back_to_tasks_kb()
     )
     return ConversationHandler.END
@@ -355,7 +415,7 @@ def main():
     app = Application.builder().token(config.TG_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_callback, pattern=r'^block:\d+$')],
+        entry_points=[CallbackQueryHandler(on_callback, pattern=r'^block_confirm:\d+$')],
         states={
             WAITING_BLOCK_COMMENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_block_comment)
