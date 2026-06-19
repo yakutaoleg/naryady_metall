@@ -147,15 +147,13 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     return InlineKeyboardMarkup(buttons)
 
 
-def task_detail_kb(task_id: int, has_drawing: bool = False):
-    rows = [[
+def task_detail_kb(task_id: int):
+    return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ ВЫПОЛНЕНО", callback_data=f"done:{task_id}"),
         InlineKeyboardButton("🚫 БЛОК", callback_data=f"block_ask:{task_id}"),
-    ]]
-    if has_drawing:
-        rows.append([InlineKeyboardButton("📄 Чертёж", callback_data=f"drawing:{task_id}")])
-    rows.append([InlineKeyboardButton("← К задачам", callback_data="tasks")])
-    return InlineKeyboardMarkup(rows)
+    ], [
+        InlineKeyboardButton("← К задачам", callback_data="tasks"),
+    ]])
 
 
 def confirm_block_kb(task_id: int):
@@ -243,7 +241,24 @@ async def show_tasks(update: Update, worker_name: str, specialization: str,
 
 async def show_task_detail(update: Update, task: dict, specialization: str):
     tariff = get_tariff(specialization, task.get('unit_weight'))
+    user = update.effective_user
 
+    # Сначала отправляем чертёж если есть
+    if task.get('drawing_link'):
+        m = re.search(r'/d/([a-zA-Z0-9_-]+)', task['drawing_link'])
+        if m:
+            try:
+                pdf_bytes, _ = _download_drawing(m.group(1))
+                name = f"{task['position']} — {task['element'] or ''}.pdf"
+                await update.callback_query.message.reply_document(
+                    document=io.BytesIO(pdf_bytes),
+                    filename=name,
+                    caption=f"📄 Чертёж: {name}"
+                )
+            except Exception as e:
+                app_logger.error(f"Drawing auto-send error: {e}")
+
+    # Затем карточка с кнопками
     lines = []
     mandatory_mark = "❗ " if task['mandatory'] else ""
     lines.append(f"{mandatory_mark}[{task['sheet_name']}] {task['position']}")
@@ -265,7 +280,7 @@ async def show_task_detail(update: Update, task: dict, specialization: str):
 
     await update.callback_query.edit_message_text(
         "\n".join(lines),
-        reply_markup=task_detail_kb(task['id'], has_drawing=bool(task.get('drawing_link')))
+        reply_markup=task_detail_kb(task['id'])
     )
 
 
@@ -400,40 +415,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # 3. Карточку редактируем → подтверждение БЕЗ кнопок (остаётся в истории навсегда)
+        # 3. Убираем кнопки с карточки, затем новым сообщением шлём подтверждение + список
         pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
-        await query.edit_message_text(
-            f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}"
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}"
         )
-        # Список задач — отдельное новое сообщение ниже
         await show_tasks(update, worker_name, specialization, bot=context.bot, chat_id=user.id)
-
-    elif data.startswith("drawing:"):
-        task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, element, drawing_link FROM work_orders WHERE id=%s", [task_id])
-        if not task or not task.get('drawing_link'):
-            await query.answer("Чертёж не прикреплён.", show_alert=True)
-            return
-        # Extract file ID from Drive URL
-        m = re.search(r'/d/([a-zA-Z0-9_-]+)', task['drawing_link'])
-        if not m:
-            await query.answer("Некорректная ссылка на чертёж.", show_alert=True)
-            return
-        file_id = m.group(1)
-        await query.answer("Загружаю чертёж...")
-        try:
-            pdf_bytes, filename = _download_drawing(file_id)
-            name = f"{task['position']} — {task['element'] or ''}.pdf"
-            await context.bot.send_document(
-                chat_id=user.id,
-                document=io.BytesIO(pdf_bytes),
-                filename=name,
-                caption=f"📄 {name}"
-            )
-            app_logger.audit('view_drawing', user.id, user.username, {'task_id': task_id}, 'success')
-        except Exception as e:
-            app_logger.error(f"Drawing download error: {e}")
-            await context.bot.send_message(chat_id=user.id, text="Не удалось загрузить чертёж.")
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
