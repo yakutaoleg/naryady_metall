@@ -401,9 +401,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # 3. Убираем кнопки с карточки, затем новым сообщением шлём подтверждение + список
+        # 3. Удаляем карточку, затем новым сообщением шлём подтверждение + список
         pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
-        await query.edit_message_reply_markup(reply_markup=None)
+        await query.delete_message()
         await context.bot.send_message(
             chat_id=user.id,
             text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}"
