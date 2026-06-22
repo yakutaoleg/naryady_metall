@@ -14,7 +14,23 @@ This file contains instructions for Claude Code when working on this project.
 
 4. **Default to the simplest solution** — no architectural changes, no new dependencies, no refactors unless specifically requested.
 
-5. **If a tool/approach fails twice, STOP and present alternatives** instead of retrying the same approach.
+5. **Surgical Changes** — touch only what was asked. Do not improve, reformat, or refactor adjacent code. If unrelated dead code is noticed — mention it, don't delete it. Every changed line must trace directly to the user's request.
+
+6. **Plan format with verification** — for multi-step tasks, state the plan as:
+   ```
+   1. [Step] → verify: [what to check]
+   2. [Step] → verify: [what to check]
+   ```
+   Do not proceed to next step until current step is verified.
+
+7. **AI Council — Вариант A (сложные решения):** Когда задача требует выбора между подходами или есть неочевидные риски — явно пройти через три угла зрения перед выводом:
+   - 🔴 Скептик: что может пойти не так?
+   - 🟡 Прагматик: что реально сделать прямо сейчас?
+   - 🟢 Архитектор: как это впишется в долгосрочную картину?
+
+8. **AI Council — Вариант B (ресёрч и рассуждения):** Если пользователь явно просит "сделай ресёрч", "порассуждай как лучше", "сравни варианты" — запускать независимые субагенты с разными задачами (исследование, критика, синтез), затем сводить результаты в итоговый вывод.
+
+9. **If a tool/approach fails twice, STOP and present alternatives** instead of retrying the same approach.
 
 6. **For documentation tasks**: Ask upfront — business audience or technical audience? What format (MD, DOCX, Notion)? No conversion attempts without confirming available tools first.
 
