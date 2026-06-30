@@ -57,7 +57,7 @@ def get_worker(tg_username: str):
 
 
 def get_active_tasks(worker_name: str, specialization: str):
-    return db.fetchall(
+    tasks = db.fetchall(
         """SELECT id, project_name, sheet_name, file_id, row_num, position, element,
                   quantity, unit_weight, total_weight, payment_sum,
                   date_plan, priority, mandatory, status, drawing_link
@@ -66,6 +66,70 @@ def get_active_tasks(worker_name: str, specialization: str):
            ORDER BY mandatory DESC, priority ASC NULLS LAST, position""",
         [worker_name, specialization]
     )
+    for t in tasks:
+        if specialization.upper() == 'СБОРКА':
+            t['deps_ready'] = _deps_ready(t['project_name'], t['element'])
+        else:
+            t['deps_ready'] = True
+    return tasks
+
+
+def _deps_ready(project_name: str, element: str) -> bool:
+    """Возвращает True если все зависимости для элемента выполнены (или зависимостей нет)."""
+    if not element:
+        return True
+    deps = db.fetchall(
+        """SELECT requires_sheet, requires_position FROM element_dependencies
+           WHERE project_name=%s AND element=%s""",
+        [project_name, element]
+    )
+    if not deps:
+        return True
+    for dep in deps:
+        row = db.fetchone(
+            """SELECT status FROM work_orders
+               WHERE project_name=%s AND sheet_name=%s AND position=%s
+               LIMIT 1""",
+            [project_name, dep['requires_sheet'], dep['requires_position']]
+        )
+        if not row or row['status'] != 'ВЫПОЛНЕНО':
+            return False
+    return True
+
+
+async def notify_assembly_workers(bot, project_name: str, element: str):
+    """Уведомить сборщиков что детали по элементу готовы."""
+    workers = db.fetchall(
+        """SELECT DISTINCT wo.executor FROM work_orders wo
+           JOIN employees e ON e.full_name = wo.executor
+           WHERE wo.project_name=%s AND wo.sheet_name='СБОРКА'
+             AND wo.element=%s AND wo.status='ПЛАН'
+             AND e.is_active=true""",
+        [project_name, element]
+    )
+    for w in workers:
+        emp = db.fetchone(
+            "SELECT id, telegram_username FROM employees WHERE full_name=%s AND is_active=true",
+            [w['executor']]
+        )
+        if not emp or not emp['telegram_username']:
+            continue
+        try:
+            chat = await bot.get_chat(f"@{emp['telegram_username']}")
+            text = (
+                f"✅ Детали готовы!\n\n"
+                f"Элемент: {element}\n"
+                f"Проект: {project_name}\n\n"
+                f"Можно брать в сборку."
+            )
+            sent = await bot.send_message(chat_id=chat.id, text=text)
+            db.execute(
+                """INSERT INTO notifications (employee_id, type, message, telegram_message_id)
+                   VALUES (%s, 'ASSEMBLY_READY', %s, %s)""",
+                [emp['id'], text, sent.message_id]
+            )
+        except Exception as e:
+            app_logger.error(f"notify_assembly error for {w['executor']}: {e}")
 
 
 def get_blocked_tasks(worker_name: str, specialization: str):
@@ -130,7 +194,10 @@ async def notify_masters(bot, task_id: int, worker_name: str, specialization: st
                 f"Причина: {comment}\n"
                 f"Время: {TODAY()}"
             )
-            sent = await bot.send_message(chat_id=chat.id, text=text)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Снять блок", callback_data=f"unblock:{task_id}"),
+            ]])
+            sent = await bot.send_message(chat_id=chat.id, text=text, reply_markup=kb)
             db.execute(
                 """INSERT INTO notifications (employee_id, type, work_order_id, message, telegram_message_id)
                    VALUES (%s, 'BLOCK_ALERT', %s, %s, %s)""",
@@ -159,7 +226,9 @@ def main_menu_kb():
 def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     buttons = []
     for t in tasks:
-        if t['mandatory']:
+        if not t.get('deps_ready', True):
+            prefix = "⏳ "
+        elif t['mandatory']:
             prefix = "❗ "
         elif mandatory_left:
             prefix = "🔒 "
@@ -386,6 +455,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Задача не найдена.", reply_markup=back_to_tasks_kb())
             return
 
+        if specialization.upper() == 'СБОРКА' and not _deps_ready(task['project_name'], task['element']):
+            await query.answer(
+                f"⏳ Ожидает готовности деталей.\nЗавершите позиции ПЛАЗМА/ПИЛА по этому элементу.",
+                show_alert=True
+            )
+            return
+
         if not task['mandatory']:
             mandatory_left = mandatory_remaining(worker_name, specialization)
             if mandatory_left:
@@ -402,7 +478,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("done:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone(
-            "SELECT position, element, payment_sum, executor, file_id, sheet_name, row_num FROM work_orders WHERE id=%s",
+            "SELECT position, element, payment_sum, executor, file_id, sheet_name, row_num, project_name FROM work_orders WHERE id=%s",
             [task_id]
         )
         if not task or task['executor'] != worker_name:
@@ -431,7 +507,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # 3. Удаляем карточку, затем новым сообщением шлём подтверждение + список
+        # 3. Проверяем не разблокировалась ли сборка по этому элементу
+        if task.get('element') and task.get('sheet_name', '').upper() != 'СБОРКА':
+            if _deps_ready(task['project_name'], task['element']):
+                try:
+                    await notify_assembly_workers(context.bot, task['project_name'], task['element'])
+                except Exception as e:
+                    app_logger.error(f"notify_assembly_workers error: {e}")
+
+        # 4. Удаляем карточку, затем новым сообщением шлём подтверждение + список
         pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
         await query.delete_message()
         await context.bot.send_message(
@@ -464,6 +548,53 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             app_logger.error(f"Drawing download error: {e}")
             await context.bot.send_message(chat_id=user.id, text="Не удалось загрузить чертёж.")
+
+    elif data.startswith("unblock:"):
+        task_id = int(data.split(":")[1])
+        task = db.fetchone(
+            "SELECT position, element, executor, sheet_name FROM work_orders WHERE id=%s AND status='БЛОК'",
+            [task_id]
+        )
+        if not task:
+            await query.answer("Задача уже разблокирована или не найдена.", show_alert=True)
+            return
+
+        # 1. Снимаем блок в БД
+        db.execute(
+            "UPDATE work_orders SET status='ПЛАН', comment=NULL WHERE id=%s AND status='БЛОК'",
+            [task_id]
+        )
+
+        # 2. Редактируем сообщение мастера — убираем кнопку, меняем статус
+        new_text = (
+            f"✅ Блок снят\n\n"
+            f"Элемент: {task['element'] or '—'}\n"
+            f"Позиция: {task['position']}\n"
+            f"Снял: мастер ({TODAY()})"
+        )
+        await query.edit_message_text(new_text)
+
+        # 3. Уведомляем рабочего
+        worker = db.fetchone(
+            "SELECT telegram_username FROM employees WHERE full_name=%s AND is_active=true",
+            [task['executor']]
+        )
+        if worker and worker['telegram_username']:
+            try:
+                worker_chat = await context.bot.get_chat(f"@{worker['telegram_username']}")
+                await context.bot.send_message(
+                    chat_id=worker_chat.id,
+                    text=(
+                        f"✅ Блокировка снята\n\n"
+                        f"Позиция: {task['position']} — {task['element'] or ''}\n"
+                        f"Можно продолжать работу."
+                    ),
+                    reply_markup=back_to_tasks_kb()
+                )
+            except Exception as e:
+                app_logger.error(f"unblock notify worker error: {e}")
+
+        app_logger.audit('unblock', user.id, user.username, {'task_id': task_id}, 'success')
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
