@@ -69,6 +69,18 @@ def get_projects():
     )
 
 
+def get_project_progress(project_name: str) -> dict:
+    row = db.fetchone(
+        """SELECT
+               COUNT(*) FILTER (WHERE status != 'АРХИВ') AS total,
+               COUNT(*) FILTER (WHERE status = 'ВЫПОЛНЕНО') AS done,
+               COUNT(*) FILTER (WHERE status = 'БЛОК') AS blocked
+           FROM work_orders WHERE project_name=%s""",
+        [project_name]
+    )
+    return row or {'total': 0, 'done': 0, 'blocked': 0}
+
+
 def get_all_blocked():
     return db.fetchall(
         """SELECT wo.id, wo.project_name, wo.sheet_name, wo.position, wo.element,
@@ -228,7 +240,7 @@ async def notify_assembly_workers(bot, project_name: str, element: str):
 
 def get_blocked_tasks(worker_name: str, specialization: str):
     return db.fetchall(
-        """SELECT id, position, element, quantity, comment
+        """SELECT id, position, element, quantity, comment, updated_at
            FROM work_orders
            WHERE executor=%s AND sheet_name=%s AND status='БЛОК'
            ORDER BY position""",
@@ -417,10 +429,16 @@ def back_to_menu_kb():
 
 async def show_menu(update: Update, worker_name: str, specialization: str,
                     role: str = '', edit: bool = False):
+    earned_today = ""
+    if not is_master(role):
+        done = get_done_today(worker_name, specialization)
+        total = sum(float(t['payment_sum'] or 0) for t in done)
+        if total > 0:
+            earned_today = f"\n💵 Заработано сегодня: {total:.2f} руб"
     text = (
         f"👷 {worker_name}\n"
         f"🔧 Специализация: {specialization}\n"
-        f"📅 Сегодня: {TODAY()}\n\n"
+        f"📅 Сегодня: {TODAY()}{earned_today}\n\n"
         f"Выберите действие:"
     )
     kb = main_menu_kb(role)
@@ -507,7 +525,9 @@ async def show_tasks(update: Update, worker_name: str, specialization: str,
         lines.append("\n🚫 Заблокированные (снимает руководитель):")
         for t in blocked:
             comment = f" — {t['comment']}" if t['comment'] else ""
-            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
+            when = t['updated_at'].strftime('%d.%m %H:%M') if t.get('updated_at') else ''
+            date_str = f" | с {when}" if when else ""
+            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}{date_str}")
 
     lines.append("\n👇 Нажмите на задачу:")
     tasks_text = "\n".join(lines)
@@ -659,9 +679,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         synced_at = project.get('last_synced_at')
         synced_str = synced_at.strftime('%d.%m.%Y %H:%M') if synced_at else 'ещё не синхронизировался'
+        prog = get_project_progress(project['project_name'])
+        total, done, blocked = prog['total'], prog['done'], prog['blocked']
+        progress_str = f"{done} из {total} позиций выполнено"
+        if blocked:
+            progress_str += f" · {blocked} в блоке 🚫"
         lines = [
             f"🗂 {project['project_name']}\n",
             f"Статус: {'🟢 АКТИВНЫЙ' if project['status'] == 'АКТИВНЫЙ' else '📦 АРХИВ'}",
+            f"📊 Прогресс: {progress_str}",
             f"Добавлен: {project['created_at'].strftime('%d.%m.%Y') if project['created_at'] else '—'}",
             f"🔄 Последняя синхронизация: {synced_str}",
         ]
@@ -931,10 +957,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('unblock', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # Если остались ещё блоки — показываем обновлённый список
+        # Возвращаем обновлённый список блоков
         remaining = get_all_blocked()
         if remaining and is_master(role):
             await query.answer("Блок снят.")
+            lines = [f"🚫 Активные блоки — {len(remaining)} шт\n"]
+            for b in remaining:
+                when = b['updated_at'].strftime('%d.%m %H:%M') if b['updated_at'] else '—'
+                lines.append(
+                    f"• [{b['sheet_name']}] {b['position']} — {b['element'] or '—'}\n"
+                    f"  👷 {b['executor']} | 📁 {b['project_name']}\n"
+                    f"  💬 {b['comment'] or '—'} | 🕐 {when}"
+                )
+            buttons = []
+            for b in remaining:
+                label = f"✅ Снять: {b['position']} — {b['element'] or ''} ({b['sheet_name']})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"unblock:{b['id']}")])
+            buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
+            await query.edit_message_text(
+                "\n\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        elif is_master(role):
+            await query.edit_message_text(
+                "✅ Все блоки сняты.",
+                reply_markup=back_to_menu_kb()
+            )
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
@@ -970,6 +1018,13 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
     if not task_id:
         await update.message.reply_text("Ошибка: начните заново с /start")
         return ConversationHandler.END
+
+    if len(comment) < 10:
+        context.user_data['block_task_id'] = task_id
+        await update.message.reply_text(
+            "⚠️ Причина слишком короткая. Опишите подробнее (минимум 10 символов):"
+        )
+        return WAITING_BLOCK_COMMENT
 
     task = db.fetchone(
         "SELECT position, element, payment_sum, file_id, sheet_name, row_num FROM work_orders WHERE id=%s",
