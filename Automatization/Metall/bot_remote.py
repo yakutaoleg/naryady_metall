@@ -672,6 +672,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
         project_id = int(data.split(":")[2])
+        import time as _time
+        _cd_key = f"sync_cooldown:{project_id}"
+        _last = context.bot_data.get(_cd_key, 0)
+        if _time.time() - _last < 60:
+            remaining = int(60 - (_time.time() - _last))
+            await query.answer(f"Синхронизация уже запущена. Подождите {remaining} сек.", show_alert=True)
+            return
+        context.bot_data[_cd_key] = _time.time()
         project = db.fetchone("SELECT project_name, sheet_id FROM projects WHERE id=%s", [project_id])
         if not project:
             await query.answer("Проект не найден.", show_alert=True)
