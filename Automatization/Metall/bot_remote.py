@@ -133,6 +133,24 @@ def scan_folder_and_register(folder_id: str, created_by: int) -> dict:
     return {'ok': True, 'project_name': project_name, 'id': project['id']}
 
 
+def get_earnings(period: str):
+    if period == 'today':
+        date_filter = "AND date_fact = CURRENT_DATE"
+    elif period == 'week':
+        date_filter = "AND date_fact >= CURRENT_DATE - INTERVAL '7 days'"
+    else:  # month
+        date_filter = "AND date_fact >= date_trunc('month', CURRENT_DATE)"
+    return db.fetchall(
+        f"""SELECT executor, COUNT(*) as tasks_count, SUM(payment_sum) as total
+            FROM work_orders
+            WHERE status='ВЫПОЛНЕНО' AND payment_sum IS NOT NULL
+            {date_filter}
+            GROUP BY executor
+            ORDER BY total DESC NULLS LAST""",
+        []
+    )
+
+
 def get_active_tasks(worker_name: str, specialization: str):
     tasks = db.fetchall(
         """SELECT id, project_name, sheet_name, file_id, row_num, position, element,
@@ -301,6 +319,9 @@ def main_menu_kb(role: str = ''):
             InlineKeyboardButton("🗂 Проекты", callback_data="projects"),
             InlineKeyboardButton("🚫 Блоки", callback_data="master:blocks"),
         ])
+        rows.insert(2, [
+            InlineKeyboardButton("📊 Выработка", callback_data="earnings:today"),
+        ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -376,6 +397,15 @@ def back_to_tasks_kb():
     ]])
 
 
+def earnings_period_kb(active: str):
+    periods = [('today', 'Сегодня'), ('week', 'Неделя'), ('month', 'Месяц')]
+    row = []
+    for p, label in periods:
+        mark = "● " if p == active else ""
+        row.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"earnings:{p}"))
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("← Главное меню", callback_data="menu")]])
+
+
 def back_to_menu_kb():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("← Главное меню", callback_data="menu"),
@@ -415,6 +445,28 @@ async def show_projects(update: Update, edit: bool = False):
         lines.append("Проектов пока нет.\nДобавьте первый проект.")
     text = "\n".join(lines)
     kb = projects_list_kb(projects)
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        msg = update.message or update.callback_query.message
+        await msg.reply_text(text, reply_markup=kb)
+
+
+async def show_earnings(update: Update, period: str = 'today', edit: bool = False):
+    rows = get_earnings(period)
+    labels = {'today': 'сегодня', 'week': 'за 7 дней', 'month': 'за месяц'}
+    period_label = labels.get(period, period)
+    if not rows:
+        text = f"📊 Выработка {period_label}\n\nДанных пока нет."
+    else:
+        total_all = sum(float(r['total'] or 0) for r in rows)
+        lines = [f"📊 Выработка {period_label}\n"]
+        for r in rows:
+            total = float(r['total'] or 0)
+            lines.append(f"👷 {r['executor']}\n  {r['tasks_count']} поз. — {total:.2f} руб")
+        lines.append(f"\n💵 Итого: {total_all:.2f} руб")
+        text = "\n".join(lines)
+    kb = earnings_period_kb(period)
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=kb)
     else:
@@ -690,6 +742,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n\n".join(lines),
             reply_markup=InlineKeyboardMarkup(buttons)
         )
+
+    elif data.startswith("earnings:"):
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        period = data.split(":")[1]
+        await show_earnings(update, period, edit=True)
 
     elif data == "tasks":
         await show_tasks(update, worker_name, specialization)
