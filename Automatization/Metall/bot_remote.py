@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 import os
@@ -854,7 +855,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.answer("Загружаю чертёж...")
         try:
-            pdf_bytes, _ = _download_drawing(m.group(1))
+            pdf_bytes, _ = await asyncio.get_event_loop().run_in_executor(
+                None, _download_drawing, m.group(1)
+            )
             name = f"{task['position']} — {task['element'] or ''}.pdf"
             await context.bot.send_document(
                 chat_id=user.id,
