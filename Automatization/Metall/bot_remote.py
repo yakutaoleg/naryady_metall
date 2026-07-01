@@ -799,10 +799,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_str = date.today().strftime('%d.%m.%Y')
 
         # 1. Обновляем PostgreSQL
-        db.execute(
+        updated = db.execute(
             "UPDATE work_orders SET status='ВЫПОЛНЕНО', date_fact=CURRENT_DATE WHERE id=%s AND status='ПЛАН'",
             [task_id]
         )
+        if not updated:
+            await query.answer("Задача уже отмечена как выполненная.", show_alert=True)
+            return
 
         # 2. Обновляем Google Sheets
         try:
@@ -837,9 +840,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("drawing:"):
         task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, element, drawing_link FROM work_orders WHERE id=%s", [task_id])
+        task = db.fetchone("SELECT position, element, drawing_link, executor FROM work_orders WHERE id=%s", [task_id])
         if not task or not task.get('drawing_link'):
             await query.answer("Чертёж не прикреплён.", show_alert=True)
+            return
+        worker_name, _, _ = _get_worker_context(update, context)
+        if task['executor'] != worker_name:
+            await query.answer("Нет доступа к этой задаче.", show_alert=True)
             return
         m = re.search(r'/d/([a-zA-Z0-9_-]+)', task['drawing_link'])
         if not m:
@@ -871,10 +878,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 1. Снимаем блок в БД
-        db.execute(
+        updated = db.execute(
             "UPDATE work_orders SET status='ПЛАН', comment=NULL WHERE id=%s AND status='БЛОК'",
             [task_id]
         )
+        if not updated:
+            await query.answer("Блок уже снят другим мастером.", show_alert=True)
+            return
 
         # 2. Редактируем сообщение мастера — убираем кнопку, меняем статус
         new_text = (
@@ -914,7 +924,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
+        task = db.fetchone("SELECT position, element, executor FROM work_orders WHERE id=%s", [task_id])
+        if task:
+            worker_name, _, _ = _get_worker_context(update, context)
+            if task['executor'] != worker_name:
+                await query.answer("Нет доступа к этой задаче.", show_alert=True)
+                return
         pos = task['position'] if task else f"#{task_id}"
         el  = task['element'] if task else ''
         await query.edit_message_text(
