@@ -73,7 +73,18 @@ ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
 def run():
     logger.info('Sync started')
     total_synced = 0
-    files = sheets.find_active_files()
+
+    # Читаем активные проекты из БД
+    projects = db.fetchall(
+        "SELECT id, project_name, sheet_id FROM projects WHERE status='АКТИВНЫЙ'",
+        []
+    )
+    files = [{'id': p['id'], 'file_id': p['sheet_id'], 'project_name': p['project_name']} for p in projects]
+
+    # Fallback на старый механизм если таблица пуста
+    if not files:
+        files = sheets.find_active_files()
+
     logger.info(f'Found {len(files)} active file(s)')
 
     for f in files:
@@ -81,6 +92,7 @@ def run():
         project_name = f['project_name']
         logger.info(f'Processing: {project_name} ({file_id})')
 
+        sheet_errors = 0
         for sheet_name in config.WORK_SHEETS:
             try:
                 rows = sheets.read_sheet(file_id, sheet_name)
@@ -96,6 +108,7 @@ def run():
                     details={'project': project_name, 'sheet': sheet_name, 'rows': synced}
                 )
             except Exception as e:
+                sheet_errors += 1
                 logger.error(f'  {sheet_name}: ERROR — {e}')
                 logger.audit(
                     action='sync_sheet',
@@ -103,34 +116,41 @@ def run():
                     result='error', error_msg=str(e)
                 )
 
-    # Синхронизация вкладки "Зависимости"
+        # Обновляем время последней синхронизации если есть id проекта
+        if f.get('id') and sheet_errors == 0:
+            db.execute(
+                "UPDATE projects SET last_synced_at=NOW() WHERE id=%s",
+                [f['id']]
+            )
+
+    # Синхронизация вкладки ЗАВИСИМОСТИ
+    # Структура: B=КТО ЖДЁТ, C=ЭЛЕМЕНТ, D=ЗАВИСИТ ОТ, E=ПОЗИЦИЯ (одна строка = одна зависимость)
     for f in files:
         file_id      = f['file_id']
         project_name = f['project_name']
         try:
-            rows = sheets.read_sheet(file_id, 'Зависимости')
+            rows = sheets.read_sheet(file_id, 'ЗАВИСИМОСТИ')
             db.execute(
                 "DELETE FROM element_dependencies WHERE project_name=%s",
                 [project_name]
             )
             count = 0
             for row in rows:
-                element   = row.get('ЭЛЕМЕНТ', '').strip()
-                req_sheet = row.get('СПЕЦИАЛИЗАЦИЯ', '').strip()
-                req_pos   = row.get('ПОЗИЦИИ', '').strip()
+                element   = row.get('ЭЛЕМЕНТ (который ждёт)', '').strip()
+                req_sheet = row.get('ЗАВИСИТ ОТ (специализация)', '').strip()
+                req_pos   = row.get('ПОЗИЦИЯ (должна быть выполнена)', '').strip()
                 if not element or not req_sheet or not req_pos:
                     continue
-                for pos in [p.strip() for p in req_pos.split(',') if p.strip()]:
-                    db.execute(
-                        """INSERT INTO element_dependencies
-                           (project_name, element, requires_sheet, requires_position)
-                           VALUES (%s, %s, %s, %s)""",
-                        [project_name, element, req_sheet, pos]
-                    )
-                    count += 1
-            logger.info(f'  Зависимости: {count} записей')
+                db.execute(
+                    """INSERT INTO element_dependencies
+                       (project_name, element, requires_sheet, requires_position)
+                       VALUES (%s, %s, %s, %s)""",
+                    [project_name, element, req_sheet, req_pos]
+                )
+                count += 1
+            logger.info(f'  ЗАВИСИМОСТИ: {count} записей')
         except Exception as e:
-            logger.error(f'  Зависимости: ERROR — {e}')
+            logger.error(f'  ЗАВИСИМОСТИ: ERROR — {e}')
 
     logger.info(f'Sync done. Total: {total_synced} rows')
     return total_synced
