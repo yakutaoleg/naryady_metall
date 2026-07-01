@@ -590,11 +590,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, worker['full_name'], worker['specialization'], worker.get('role', ''))
 
 
+_ROLE_TTL = 600  # 10 минут
+
 def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import time as _time
     worker_name    = context.user_data.get('worker_name')
     specialization = context.user_data.get('specialization')
     role           = context.user_data.get('role', '')
-    if not worker_name:
+    role_cached_at = context.user_data.get('role_cached_at', 0)
+    if not worker_name or (_time.time() - role_cached_at) > _ROLE_TTL:
         user = update.effective_user
         worker = get_worker(user.username)
         if not worker:
@@ -605,6 +609,7 @@ def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['worker_name']    = worker_name
         context.user_data['specialization'] = specialization
         context.user_data['role']           = role
+        context.user_data['role_cached_at'] = _time.time()
     return worker_name, specialization, role
 
 
@@ -1038,7 +1043,7 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         app_logger.error(f"scan_folder error: {e}")
         await update.message.reply_text(
-            f"❌ Ошибка при сканировании папки:\n{e}\n\nПроверьте доступ и попробуйте снова."
+            "❌ Ошибка при сканировании папки. Проверьте доступ и попробуйте снова."
         )
         return WAITING_PROJECT_LINK
 
