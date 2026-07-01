@@ -181,16 +181,14 @@ def _deps_ready(project_name: str, element: str) -> bool:
     )
     if not deps:
         return True
-    for dep in deps:
-        row = db.fetchone(
-            """SELECT status FROM work_orders
-               WHERE project_name=%s AND sheet_name=%s AND position=%s
-               LIMIT 1""",
-            [project_name, dep['requires_sheet'], dep['requires_position']]
-        )
-        if not row or row['status'] != 'ВЫПОЛНЕНО':
-            return False
-    return True
+    pairs = tuple((d['requires_sheet'], d['requires_position']) for d in deps)
+    rows = db.fetchall(
+        """SELECT sheet_name, position, status FROM work_orders
+           WHERE project_name=%s AND (sheet_name, position) IN %s""",
+        [project_name, pairs]
+    )
+    done = {(r['sheet_name'], r['position']) for r in rows if r['status'] == 'ВЫПОЛНЕНО'}
+    return all(p in done for p in pairs)
 
 
 async def notify_assembly_workers(bot, project_name: str, element: str):
