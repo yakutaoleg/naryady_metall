@@ -81,11 +81,7 @@ def run():
     )
     files = [{'id': p['id'], 'file_id': p['sheet_id'], 'project_name': p['project_name']} for p in projects]
 
-    # Fallback на старый механизм если таблица пуста
-    if not files:
-        files = sheets.find_active_files()
-
-    logger.info(f'Found {len(files)} active file(s)')
+    logger.info(f'Found {len(files)} active project(s) in DB')
 
     for f in files:
         file_id      = f['file_id']
