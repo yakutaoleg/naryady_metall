@@ -17,17 +17,18 @@ from src.sheets import update_task_status
 from google.oauth2.service_account import Credentials as _SACredentials
 from googleapiclient.discovery import build as _gdrive_build
 
-def _download_drawing(file_id: str) -> bytes:
-    """Download a file from Google Drive as PDF bytes."""
+def _download_drawing(file_id: str):
+    """Download a file from Google Drive. Returns (bytes, filename, mime_type)."""
     creds = _SACredentials.from_service_account_file(
         config.GOOGLE_SA_KEY,
         scopes=['https://www.googleapis.com/auth/drive.readonly']
     )
     drive = _gdrive_build('drive', 'v3', credentials=creds)
-    # If it's a Google Doc/Sheet — export as PDF; otherwise download directly
     meta = drive.files().get(fileId=file_id, fields='mimeType,name', supportsAllDrives=True).execute()
-    if 'google-apps' in meta.get('mimeType', ''):
+    mime = meta.get('mimeType', '')
+    if 'google-apps' in mime:
         request = drive.files().export_media(fileId=file_id, mimeType='application/pdf')
+        mime = 'application/pdf'
     else:
         request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
@@ -36,7 +37,7 @@ def _download_drawing(file_id: str) -> bytes:
     done = False
     while not done:
         _, done = dl.next_chunk()
-    return buf.getvalue(), meta.get('name', 'drawing.pdf')
+    return buf.getvalue(), meta.get('name', 'drawing'), mime
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL))
 
@@ -90,6 +91,32 @@ def get_all_blocked():
            ORDER BY wo.updated_at DESC""",
         []
     )
+
+
+def register_spreadsheet_direct(sheet_id: str, created_by: int) -> dict:
+    """Регистрирует проект по прямой ссылке на Google Sheets (без папки Drive).
+    Возвращает {'ok': True, 'project_name': ..., 'id': ...} или {'ok': False, 'error': ...}
+    """
+    existing = db.fetchone("SELECT id, project_name FROM projects WHERE sheet_id=%s", [sheet_id])
+    if existing:
+        return {'ok': False, 'error': f"Проект «{existing['project_name']}» уже добавлен."}
+
+    from googleapiclient.discovery import build as _sheets_build
+    creds = _SACredentials.from_service_account_file(
+        config.GOOGLE_SA_KEY,
+        scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+    )
+    svc = _sheets_build('sheets', 'v4', credentials=creds)
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields='properties.title').execute()
+    project_name = meta['properties']['title']
+
+    db.execute(
+        """INSERT INTO projects (project_name, folder_id, sheet_id, drawings_folder_id, status, created_by)
+           VALUES (%s, %s, %s, NULL, 'АКТИВНЫЙ', %s)""",
+        [project_name, sheet_id, sheet_id, created_by]
+    )
+    project = db.fetchone("SELECT id FROM projects WHERE sheet_id=%s", [sheet_id])
+    return {'ok': True, 'project_name': project_name, 'id': project['id']}
 
 
 def scan_folder_and_register(folder_id: str, created_by: int) -> dict:
@@ -892,16 +919,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.answer("Загружаю чертёж...")
         try:
-            pdf_bytes, _ = await asyncio.get_event_loop().run_in_executor(
+            file_bytes, _, mime = await asyncio.get_event_loop().run_in_executor(
                 None, _download_drawing, m.group(1)
             )
-            name = f"{task['position']} — {task['element'] or ''}.pdf"
-            await context.bot.send_document(
-                chat_id=user.id,
-                document=io.BytesIO(pdf_bytes),
-                filename=name,
-                caption=f"📄 {name}"
-            )
+            base_name = f"{task['position']} — {task['element'] or ''}"
+            if mime == 'image/png':
+                await context.bot.send_photo(
+                    chat_id=user.id,
+                    photo=io.BytesIO(file_bytes),
+                    caption=f"🖼 {base_name}"
+                )
+            else:
+                ext = 'jpg' if mime == 'image/jpeg' else 'pdf'
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=io.BytesIO(file_bytes),
+                    filename=f"{base_name}.{ext}",
+                    caption=f"📄 {base_name}"
+                )
             app_logger.audit('view_drawing', user.id, user.username, {'task_id': task_id}, 'success')
         except Exception as e:
             app_logger.error(f"Drawing download error: {e}")
@@ -1078,12 +1113,44 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     text = update.message.text.strip()
 
-    # Извлекаем folder_id из ссылки
+    # Прямая ссылка на spreadsheet
+    m_sheet = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', text)
+    if m_sheet:
+        sheet_id = m_sheet.group(1)
+        await update.message.reply_text("🔍 Подключаю таблицу...")
+        try:
+            result = register_spreadsheet_direct(sheet_id, created_by=user.id)
+        except Exception as e:
+            app_logger.error(f"register_spreadsheet error: {e}")
+            await update.message.reply_text(
+                "❌ Ошибка при подключении таблицы. Убедитесь что сервисный аккаунт имеет доступ."
+            )
+            return WAITING_PROJECT_LINK
+        if not result['ok']:
+            await update.message.reply_text(
+                f"❌ {result['error']}\n\nПопробуйте другую ссылку или /cancel для отмены."
+            )
+            return WAITING_PROJECT_LINK
+        _, _, role = _get_worker_context(update, context)
+        await update.message.reply_text(
+            f"✅ Проект добавлен!\n\n"
+            f"📊 {result['project_name']}\n\n"
+            f"Данные появятся у рабочих после следующей синхронизации (до 15 мин).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗂 К проектам", callback_data="projects"),
+                InlineKeyboardButton("← Меню", callback_data="menu"),
+            ]])
+        )
+        return ConversationHandler.END
+
+    # Ссылка на папку Drive
     m = re.search(r'/folders/([a-zA-Z0-9_-]+)', text)
     if not m:
         await update.message.reply_text(
-            "❌ Не удалось распознать ссылку на папку.\n"
-            "Формат: https://drive.google.com/drive/folders/FOLDER_ID\n\n"
+            "❌ Не удалось распознать ссылку.\n"
+            "Поддерживаются:\n"
+            "• Ссылка на таблицу: https://docs.google.com/spreadsheets/d/ID/...\n"
+            "• Ссылка на папку: https://drive.google.com/drive/folders/ID\n\n"
             "Попробуйте ещё раз или нажмите /cancel для отмены."
         )
         return WAITING_PROJECT_LINK
