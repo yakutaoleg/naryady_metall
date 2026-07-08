@@ -1,9 +1,9 @@
-import asyncio
 import logging
 import sys
 import os
 import io
 import re
+import asyncio
 from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials as _SACredentials
 from googleapiclient.discovery import build as _gdrive_build
 
 def _download_drawing(file_id: str):
-    """Download a file from Google Drive. Returns (bytes, filename, mime_type)."""
+    """Download a file from Google Drive. Returns (bytes, name, mime_type)."""
     creds = _SACredentials.from_service_account_file(
         config.GOOGLE_SA_KEY,
         scopes=['https://www.googleapis.com/auth/drive.readonly']
@@ -50,13 +50,20 @@ TODAY = lambda: date.today().strftime('%d.%m.%Y')
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def get_worker(tg_username: str):
-    if not tg_username:
-        return None
-    return db.fetchone(
-        "SELECT full_name, specialization, role FROM employees WHERE telegram_username=%s AND is_active=true",
-        [tg_username]
-    )
+def get_worker(tg_username: str, tg_id: int = None):
+    if tg_id:
+        row = db.fetchone(
+            "SELECT full_name, specialization, role FROM employees WHERE telegram_id=%s AND is_active=true",
+            [tg_id]
+        )
+        if row:
+            return row
+    if tg_username:
+        return db.fetchone(
+            "SELECT full_name, specialization, role FROM employees WHERE telegram_username=%s AND is_active=true",
+            [tg_username]
+        )
+    return None
 
 
 def is_master(role: str) -> bool:
@@ -70,18 +77,6 @@ def get_projects():
     )
 
 
-def get_project_progress(project_name: str) -> dict:
-    row = db.fetchone(
-        """SELECT
-               COUNT(*) FILTER (WHERE status != 'АРХИВ') AS total,
-               COUNT(*) FILTER (WHERE status = 'ВЫПОЛНЕНО') AS done,
-               COUNT(*) FILTER (WHERE status = 'БЛОК') AS blocked
-           FROM work_orders WHERE project_name=%s""",
-        [project_name]
-    )
-    return row or {'total': 0, 'done': 0, 'blocked': 0}
-
-
 def get_all_blocked():
     return db.fetchall(
         """SELECT wo.id, wo.project_name, wo.sheet_name, wo.position, wo.element,
@@ -91,32 +86,6 @@ def get_all_blocked():
            ORDER BY wo.updated_at DESC""",
         []
     )
-
-
-def register_spreadsheet_direct(sheet_id: str, created_by: int) -> dict:
-    """Регистрирует проект по прямой ссылке на Google Sheets (без папки Drive).
-    Возвращает {'ok': True, 'project_name': ..., 'id': ...} или {'ok': False, 'error': ...}
-    """
-    existing = db.fetchone("SELECT id, project_name FROM projects WHERE sheet_id=%s", [sheet_id])
-    if existing:
-        return {'ok': False, 'error': f"Проект «{existing['project_name']}» уже добавлен."}
-
-    from googleapiclient.discovery import build as _sheets_build
-    creds = _SACredentials.from_service_account_file(
-        config.GOOGLE_SA_KEY,
-        scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
-    )
-    svc = _sheets_build('sheets', 'v4', credentials=creds)
-    meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields='properties.title').execute()
-    project_name = meta['properties']['title']
-
-    db.execute(
-        """INSERT INTO projects (project_name, folder_id, sheet_id, drawings_folder_id, status, created_by)
-           VALUES (%s, %s, %s, NULL, 'АКТИВНЫЙ', %s)""",
-        [project_name, sheet_id, sheet_id, created_by]
-    )
-    project = db.fetchone("SELECT id FROM projects WHERE sheet_id=%s", [sheet_id])
-    return {'ok': True, 'project_name': project_name, 'id': project['id']}
 
 
 def scan_folder_and_register(folder_id: str, created_by: int) -> dict:
@@ -220,14 +189,16 @@ def _deps_ready(project_name: str, element: str) -> bool:
     )
     if not deps:
         return True
-    pairs = tuple((d['requires_sheet'], d['requires_position']) for d in deps)
-    rows = db.fetchall(
-        """SELECT sheet_name, position, status FROM work_orders
-           WHERE project_name=%s AND (sheet_name, position) IN %s""",
-        [project_name, pairs]
-    )
-    done = {(r['sheet_name'], r['position']) for r in rows if r['status'] == 'ВЫПОЛНЕНО'}
-    return all(p in done for p in pairs)
+    for dep in deps:
+        row = db.fetchone(
+            """SELECT status FROM work_orders
+               WHERE project_name=%s AND sheet_name=%s AND position=%s
+               LIMIT 1""",
+            [project_name, dep['requires_sheet'], dep['requires_position']]
+        )
+        if not row or row['status'] != 'ВЫПОЛНЕНО':
+            return False
+    return True
 
 
 async def notify_assembly_workers(bot, project_name: str, element: str):
@@ -267,7 +238,7 @@ async def notify_assembly_workers(bot, project_name: str, element: str):
 
 def get_blocked_tasks(worker_name: str, specialization: str):
     return db.fetchall(
-        """SELECT id, position, element, quantity, comment, updated_at
+        """SELECT id, position, element, quantity, comment
            FROM work_orders
            WHERE executor=%s AND sheet_name=%s AND status='БЛОК'
            ORDER BY position""",
@@ -456,16 +427,10 @@ def back_to_menu_kb():
 
 async def show_menu(update: Update, worker_name: str, specialization: str,
                     role: str = '', edit: bool = False):
-    earned_today = ""
-    if not is_master(role):
-        done = get_done_today(worker_name, specialization)
-        total = sum(float(t['payment_sum'] or 0) for t in done)
-        if total > 0:
-            earned_today = f"\n💵 Заработано сегодня: {total:.2f} руб"
     text = (
         f"👷 {worker_name}\n"
         f"🔧 Специализация: {specialization}\n"
-        f"📅 Сегодня: {TODAY()}{earned_today}\n\n"
+        f"📅 Сегодня: {TODAY()}\n\n"
         f"Выберите действие:"
     )
     kb = main_menu_kb(role)
@@ -552,9 +517,7 @@ async def show_tasks(update: Update, worker_name: str, specialization: str,
         lines.append("\n🚫 Заблокированные (снимает руководитель):")
         for t in blocked:
             comment = f" — {t['comment']}" if t['comment'] else ""
-            when = t['updated_at'].strftime('%d.%m %H:%M') if t.get('updated_at') else ''
-            date_str = f" | с {when}" if when else ""
-            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}{date_str}")
+            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
 
     lines.append("\n👇 Нажмите на задачу:")
     tasks_text = "\n".join(lines)
@@ -616,7 +579,7 @@ async def show_done_today(update: Update, worker_name: str, specialization: str)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    worker = get_worker(user.username)
+    worker = get_worker(user.username, user.id)
 
     app_logger.audit('bot_start', user.id, user.username,
                      {'found': bool(worker)}, 'success' if worker else 'not_found')
@@ -635,17 +598,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, worker['full_name'], worker['specialization'], worker.get('role', ''))
 
 
-_ROLE_TTL = 600  # 10 минут
-
 def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import time as _time
     worker_name    = context.user_data.get('worker_name')
     specialization = context.user_data.get('specialization')
     role           = context.user_data.get('role', '')
-    role_cached_at = context.user_data.get('role_cached_at', 0)
-    if not worker_name or (_time.time() - role_cached_at) > _ROLE_TTL:
+    if not worker_name:
         user = update.effective_user
-        worker = get_worker(user.username)
+        worker = get_worker(user.username, user.id)
         if not worker:
             return None, None, None
         worker_name    = worker['full_name']
@@ -654,7 +613,6 @@ def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['worker_name']    = worker_name
         context.user_data['specialization'] = specialization
         context.user_data['role']           = role
-        context.user_data['role_cached_at'] = _time.time()
     return worker_name, specialization, role
 
 
@@ -706,15 +664,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         synced_at = project.get('last_synced_at')
         synced_str = synced_at.strftime('%d.%m.%Y %H:%M') if synced_at else 'ещё не синхронизировался'
-        prog = get_project_progress(project['project_name'])
-        total, done, blocked = prog['total'], prog['done'], prog['blocked']
-        progress_str = f"{done} из {total} позиций выполнено"
-        if blocked:
-            progress_str += f" · {blocked} в блоке 🚫"
         lines = [
             f"🗂 {project['project_name']}\n",
             f"Статус: {'🟢 АКТИВНЫЙ' if project['status'] == 'АКТИВНЫЙ' else '📦 АРХИВ'}",
-            f"📊 Прогресс: {progress_str}",
             f"Добавлен: {project['created_at'].strftime('%d.%m.%Y') if project['created_at'] else '—'}",
             f"🔄 Последняя синхронизация: {synced_str}",
         ]
@@ -728,14 +680,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
         project_id = int(data.split(":")[2])
-        import time as _time
-        _cd_key = f"sync_cooldown:{project_id}"
-        _last = context.bot_data.get(_cd_key, 0)
-        if _time.time() - _last < 60:
-            remaining = int(60 - (_time.time() - _last))
-            await query.answer(f"Синхронизация уже запущена. Подождите {remaining} сек.", show_alert=True)
-            return
-        context.bot_data[_cd_key] = _time.time()
         project = db.fetchone("SELECT project_name, sheet_id FROM projects WHERE id=%s", [project_id])
         if not project:
             await query.answer("Проект не найден.", show_alert=True)
@@ -864,13 +808,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_str = date.today().strftime('%d.%m.%Y')
 
         # 1. Обновляем PostgreSQL
-        updated = db.execute(
+        db.execute(
             "UPDATE work_orders SET status='ВЫПОЛНЕНО', date_fact=CURRENT_DATE WHERE id=%s AND status='ПЛАН'",
             [task_id]
         )
-        if not updated:
-            await query.answer("Задача уже отмечена как выполненная.", show_alert=True)
-            return
 
         # 2. Обновляем Google Sheets
         try:
@@ -905,13 +846,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("drawing:"):
         task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, element, drawing_link, executor FROM work_orders WHERE id=%s", [task_id])
+        task = db.fetchone("SELECT * FROM work_orders WHERE id=%s", [task_id])
         if not task or not task.get('drawing_link'):
             await query.answer("Чертёж не прикреплён.", show_alert=True)
-            return
-        worker_name, _, _ = _get_worker_context(update, context)
-        if task['executor'] != worker_name:
-            await query.answer("Нет доступа к этой задаче.", show_alert=True)
             return
         m = re.search(r'/d/([a-zA-Z0-9_-]+)', task['drawing_link'])
         if not m:
@@ -938,6 +875,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"📄 {base_name}"
                 )
             app_logger.audit('view_drawing', user.id, user.username, {'task_id': task_id}, 'success')
+            # Re-send task card as new message so user doesn't scroll up
+            task_full = db.fetchone("SELECT * FROM work_orders WHERE id=%s", [task_id])
+            if task_full:
+                from config import WORK_SHEETS
+                specialization = task_full.get('sheet_name', '')
+                tariff = get_tariff(specialization, task_full.get('unit_weight'))
+                lines = []
+                mandatory_mark = "❗ " if task_full['mandatory'] else ""
+                lines.append(f"{mandatory_mark}[{task_full['sheet_name']}] {task_full['position']}")
+                lines.append(f"Элемент: {task_full['element'] or '—'}")
+                lines.append(f"Проект: {task_full['project_name']}")
+                lines.append(f"Кол-во: {task_full['quantity'] or '?'} шт")
+                if task_full.get('unit_weight'):
+                    lines.append(f"Масса ед.: {task_full['unit_weight']} кг  |  Масса всего: {task_full['total_weight'] or '?'} кг")
+                if task_full.get('date_plan'):
+                    lines.append(f"Дата план: {task_full['date_plan']}")
+                lines.append(f"Обязательная: {'ДА' if task_full['mandatory'] else 'НЕТ'}")
+                lines.append("")
+                if tariff:
+                    lines.append(f"💰 Тариф: {tariff['rate']} {tariff['unit']}")
+                if task_full.get('payment_sum'):
+                    lines.append(f"💵 К оплате: {task_full['payment_sum']} руб")
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=chr(10).join(lines),
+                    reply_markup=task_detail_kb(task_id, has_drawing=bool(task_full.get('drawing_link')))
+                )
         except Exception as e:
             app_logger.error(f"Drawing download error: {e}")
             await context.bot.send_message(chat_id=user.id, text="Не удалось загрузить чертёж.")
@@ -953,13 +917,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 1. Снимаем блок в БД
-        updated = db.execute(
+        db.execute(
             "UPDATE work_orders SET status='ПЛАН', comment=NULL WHERE id=%s AND status='БЛОК'",
             [task_id]
         )
-        if not updated:
-            await query.answer("Блок уже снят другим мастером.", show_alert=True)
-            return
 
         # 2. Редактируем сообщение мастера — убираем кнопку, меняем статус
         new_text = (
@@ -992,41 +953,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('unblock', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # Возвращаем обновлённый список блоков
+        # Если остались ещё блоки — показываем обновлённый список
         remaining = get_all_blocked()
         if remaining and is_master(role):
             await query.answer("Блок снят.")
-            lines = [f"🚫 Активные блоки — {len(remaining)} шт\n"]
-            for b in remaining:
-                when = b['updated_at'].strftime('%d.%m %H:%M') if b['updated_at'] else '—'
-                lines.append(
-                    f"• [{b['sheet_name']}] {b['position']} — {b['element'] or '—'}\n"
-                    f"  👷 {b['executor']} | 📁 {b['project_name']}\n"
-                    f"  💬 {b['comment'] or '—'} | 🕐 {when}"
-                )
-            buttons = []
-            for b in remaining:
-                label = f"✅ Снять: {b['position']} — {b['element'] or ''} ({b['sheet_name']})"
-                buttons.append([InlineKeyboardButton(label, callback_data=f"unblock:{b['id']}")])
-            buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
-            await query.edit_message_text(
-                "\n\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-        elif is_master(role):
-            await query.edit_message_text(
-                "✅ Все блоки сняты.",
-                reply_markup=back_to_menu_kb()
-            )
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
-        task = db.fetchone("SELECT position, element, executor FROM work_orders WHERE id=%s", [task_id])
-        if task:
-            worker_name, _, _ = _get_worker_context(update, context)
-            if task['executor'] != worker_name:
-                await query.answer("Нет доступа к этой задаче.", show_alert=True)
-                return
+        task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
         pos = task['position'] if task else f"#{task_id}"
         el  = task['element'] if task else ''
         await query.edit_message_text(
@@ -1053,13 +987,6 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
     if not task_id:
         await update.message.reply_text("Ошибка: начните заново с /start")
         return ConversationHandler.END
-
-    if len(comment) < 10:
-        context.user_data['block_task_id'] = task_id
-        await update.message.reply_text(
-            "⚠️ Причина слишком короткая. Опишите подробнее (минимум 10 символов):"
-        )
-        return WAITING_BLOCK_COMMENT
 
     task = db.fetchone(
         "SELECT position, element, payment_sum, file_id, sheet_name, row_num FROM work_orders WHERE id=%s",
@@ -1113,44 +1040,12 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     text = update.message.text.strip()
 
-    # Прямая ссылка на spreadsheet
-    m_sheet = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', text)
-    if m_sheet:
-        sheet_id = m_sheet.group(1)
-        await update.message.reply_text("🔍 Подключаю таблицу...")
-        try:
-            result = register_spreadsheet_direct(sheet_id, created_by=user.id)
-        except Exception as e:
-            app_logger.error(f"register_spreadsheet error: {e}")
-            await update.message.reply_text(
-                "❌ Ошибка при подключении таблицы. Убедитесь что сервисный аккаунт имеет доступ."
-            )
-            return WAITING_PROJECT_LINK
-        if not result['ok']:
-            await update.message.reply_text(
-                f"❌ {result['error']}\n\nПопробуйте другую ссылку или /cancel для отмены."
-            )
-            return WAITING_PROJECT_LINK
-        _, _, role = _get_worker_context(update, context)
-        await update.message.reply_text(
-            f"✅ Проект добавлен!\n\n"
-            f"📊 {result['project_name']}\n\n"
-            f"Данные появятся у рабочих после следующей синхронизации (до 15 мин).",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗂 К проектам", callback_data="projects"),
-                InlineKeyboardButton("← Меню", callback_data="menu"),
-            ]])
-        )
-        return ConversationHandler.END
-
-    # Ссылка на папку Drive
+    # Извлекаем folder_id из ссылки
     m = re.search(r'/folders/([a-zA-Z0-9_-]+)', text)
     if not m:
         await update.message.reply_text(
-            "❌ Не удалось распознать ссылку.\n"
-            "Поддерживаются:\n"
-            "• Ссылка на таблицу: https://docs.google.com/spreadsheets/d/ID/...\n"
-            "• Ссылка на папку: https://drive.google.com/drive/folders/ID\n\n"
+            "❌ Не удалось распознать ссылку на папку.\n"
+            "Формат: https://drive.google.com/drive/folders/FOLDER_ID\n\n"
             "Попробуйте ещё раз или нажмите /cancel для отмены."
         )
         return WAITING_PROJECT_LINK
@@ -1163,7 +1058,7 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         app_logger.error(f"scan_folder error: {e}")
         await update.message.reply_text(
-            "❌ Ошибка при сканировании папки. Проверьте доступ и попробуйте снова."
+            f"❌ Ошибка при сканировании папки:\n{e}\n\nПроверьте доступ и попробуйте снова."
         )
         return WAITING_PROJECT_LINK
 
