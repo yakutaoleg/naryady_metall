@@ -104,13 +104,16 @@ def run():
                     details={'project': project_name, 'sheet': sheet_name, 'rows': synced}
                 )
             except Exception as e:
-                sheet_errors += 1
-                logger.error(f'  {sheet_name}: ERROR — {e}')
-                logger.audit(
-                    action='sync_sheet',
-                    details={'project': project_name, 'sheet': sheet_name},
-                    result='error', error_msg=str(e)
-                )
+                if 'WorksheetNotFound' in type(e).__name__ or 'not found' in str(e).lower():
+                    logger.info(f'  {sheet_name}: лист отсутствует, пропускаем')
+                else:
+                    sheet_errors += 1
+                    logger.error(f'  {sheet_name}: ERROR — {e}')
+                    logger.audit(
+                        action='sync_sheet',
+                        details={'project': project_name, 'sheet': sheet_name},
+                        result='error', error_msg=str(e)
+                    )
 
         # Обновляем время последней синхронизации если есть id проекта
         if f.get('id') and sheet_errors == 0:
@@ -126,26 +129,24 @@ def run():
         project_name = f['project_name']
         try:
             rows = sheets.read_sheet(file_id, 'ЗАВИСИМОСТИ')
+            db.execute(
+                "DELETE FROM element_dependencies WHERE project_name=%s",
+                [project_name]
+            )
             count = 0
-            with db.transaction() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "DELETE FROM element_dependencies WHERE project_name=%s",
-                        [project_name]
-                    )
-                    for row in rows:
-                        element   = row.get('ЭЛЕМЕНТ (который ждёт)', '').strip()
-                        req_sheet = row.get('ЗАВИСИТ ОТ (специализация)', '').strip()
-                        req_pos   = row.get('ПОЗИЦИЯ (должна быть выполнена)', '').strip()
-                        if not element or not req_sheet or not req_pos:
-                            continue
-                        cur.execute(
-                            """INSERT INTO element_dependencies
-                               (project_name, element, requires_sheet, requires_position)
-                               VALUES (%s, %s, %s, %s)""",
-                            [project_name, element, req_sheet, req_pos]
-                        )
-                        count += 1
+            for row in rows:
+                element   = row.get('ЭЛЕМЕНТ (который ждёт)', '').strip()
+                req_sheet = row.get('ЗАВИСИТ ОТ (специализация)', '').strip()
+                req_pos   = row.get('ПОЗИЦИЯ (должна быть выполнена)', '').strip()
+                if not element or not req_sheet or not req_pos:
+                    continue
+                db.execute(
+                    """INSERT INTO element_dependencies
+                       (project_name, element, requires_sheet, requires_position)
+                       VALUES (%s, %s, %s, %s)""",
+                    [project_name, element, req_sheet, req_pos]
+                )
+                count += 1
             logger.info(f'  ЗАВИСИМОСТИ: {count} записей')
         except Exception as e:
             logger.error(f'  ЗАВИСИМОСТИ: ERROR — {e}')
