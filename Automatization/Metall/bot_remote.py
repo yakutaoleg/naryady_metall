@@ -316,21 +316,23 @@ async def notify_masters(bot, task_id: int, worker_name: str, specialization: st
 # ---------------------------------------------------------------------------
 
 def main_menu_kb(role: str = ''):
-    rows = [
-        [
-            InlineKeyboardButton("📋 Задачи на сегодня", callback_data="tasks"),
-            InlineKeyboardButton("✅ Выполнено сегодня", callback_data="done_today"),
-        ],
-        [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
-    ]
     if is_master(role):
-        rows.insert(1, [
-            InlineKeyboardButton("🗂 Проекты", callback_data="projects"),
-            InlineKeyboardButton("🚫 Блоки", callback_data="master:blocks"),
-        ])
-        rows.insert(2, [
-            InlineKeyboardButton("📊 Выработка", callback_data="earnings:today"),
-        ])
+        rows = [
+            [
+                InlineKeyboardButton("🗂 Проекты", callback_data="projects"),
+                InlineKeyboardButton("🚫 Блоки", callback_data="master:blocks"),
+            ],
+            [InlineKeyboardButton("📊 Выработка", callback_data="earnings:today")],
+            [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
+        ]
+    else:
+        rows = [
+            [
+                InlineKeyboardButton("📋 Задачи на сегодня", callback_data="tasks"),
+                InlineKeyboardButton("✅ Выполнено сегодня", callback_data="done_today"),
+            ],
+            [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
+        ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -338,8 +340,19 @@ def projects_list_kb(projects: list):
     rows = []
     for p in projects:
         status_icon = "🟢" if p['status'] == 'АКТИВНЫЙ' else "📦"
+        total = p.get('total', 0)
+        done = p.get('done', 0)
+        pct = int(done / total * 100) if total else 0
+        if total == 0:
+            progress = "—"
+        elif pct == 100:
+            progress = f"100% ✅"
+        elif pct == 0:
+            progress = f"0% не приступали"
+        else:
+            progress = f"{pct}% в процессе ({done}/{total})"
         rows.append([InlineKeyboardButton(
-            f"{status_icon} {p['project_name']}",
+            f"{status_icon} {p['project_name']} — {progress}",
             callback_data=f"project:detail:{p['id']}"
         )])
     rows.append([InlineKeyboardButton("➕ Добавить проект", callback_data="project:add")])
@@ -443,6 +456,17 @@ async def show_menu(update: Update, worker_name: str, specialization: str,
 
 async def show_projects(update: Update, edit: bool = False):
     projects = get_projects()
+    # Load stats for each project
+    for p in projects:
+        stat = db.fetchone(
+            """SELECT COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE status='ВЫПОЛНЕНО') AS done
+               FROM work_orders WHERE project_id=%s""",
+            [p['id']]
+        )
+        p['total'] = stat['total'] if stat else 0
+        p['done'] = stat['done'] if stat else 0
+
     active = [p for p in projects if p['status'] == 'АКТИВНЫЙ']
     archived = [p for p in projects if p['status'] != 'АКТИВНЫЙ']
     lines = ["🗂 Управление проектами\n"]
@@ -664,14 +688,63 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         synced_at = project.get('last_synced_at')
         synced_str = synced_at.strftime('%d.%m.%Y %H:%M') if synced_at else 'ещё не синхронизировался'
-        lines = [
-            f"🗂 {project['project_name']}\n",
-            f"Статус: {'🟢 АКТИВНЫЙ' if project['status'] == 'АКТИВНЫЙ' else '📦 АРХИВ'}",
-            f"Добавлен: {project['created_at'].strftime('%d.%m.%Y') if project['created_at'] else '—'}",
-            f"🔄 Последняя синхронизация: {synced_str}",
-        ]
+
+        sheet_stats = db.fetchall("""
+            SELECT sheet_name,
+                   COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE status='ВЫПОЛНЕНО') AS done,
+                   COUNT(*) FILTER (WHERE status='БЛОК') AS blocked
+            FROM work_orders WHERE project_id=%s
+            GROUP BY sheet_name ORDER BY sheet_name
+        """, [project_id])
+
+        total_all = sum(r['total'] for r in sheet_stats)
+        done_all  = sum(r['done']  for r in sheet_stats)
+        blocked_all = sum(r['blocked'] for r in sheet_stats)
+
+        overdue = db.fetchone("""
+            SELECT COUNT(*) AS cnt FROM work_orders
+            WHERE project_id=%s AND status != 'ВЫПОЛНЕНО'
+              AND date_plan IS NOT NULL AND date_plan < CURRENT_DATE
+        """, [project_id])
+        overdue_cnt = overdue['cnt'] if overdue else 0
+
+        payment = db.fetchone("""
+            SELECT COALESCE(SUM(CASE WHEN status='ВЫПОЛНЕНО' THEN payment_sum ELSE 0 END), 0) AS done
+            FROM work_orders WHERE project_id=%s
+        """, [project_id])
+
+        pct_all = int(done_all / total_all * 100) if total_all else 0
+        status_icon = '🟢' if project['status'] == 'АКТИВНЫЙ' else '📦'
+
+        out = [f"🏗 {project['project_name']}"]
+        out.append(f"{status_icon} {'АКТИВНЫЙ' if project['status'] == 'АКТИВНЫЙ' else 'АРХИВ'}  |  🔄 {synced_str}")
+        out.append("━━━━━━━━━━━━━━━━")
+        out.append(f"📊 Прогресс: {done_all}/{total_all} ({pct_all}%)")
+        out.append("")
+        out.append("🔧 По цехам:")
+
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА']
+        stats_map = {r['sheet_name']: r for r in sheet_stats}
+        for sheet in SHEET_ORDER:
+            if sheet not in stats_map:
+                continue
+            r = stats_map[sheet]
+            pct = int(r['done'] / r['total'] * 100) if r['total'] else 0
+            filled = int(pct / 10)
+            bar = '█' * filled + '░' * (10 - filled)
+            out.append(f"  {sheet:<12} {bar} {r['done']}/{r['total']}")
+
+        if blocked_all:
+            out.append("")
+            out.append(f"🚫 Блоков: {blocked_all}")
+        if overdue_cnt:
+            out.append(f"⚠️ Просрочено: {overdue_cnt}")
+        if payment and payment['done']:
+            out.append(f"💰 Выполнено: {float(payment['done']):.0f} руб")
+
         await query.edit_message_text(
-            "\n".join(lines),
+            chr(10).join(out),
             reply_markup=project_detail_kb(project_id, project['status'])
         )
 
