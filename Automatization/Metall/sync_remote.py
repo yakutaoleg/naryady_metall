@@ -14,9 +14,10 @@ def _parse_date(s):
     return None
 
 def _normalize_row(row: dict, sheet_name: str, row_num: int,
-                   project_name: str, file_id: str) -> dict:
+                   project_name: str, file_id: str, project_id: int = None) -> dict:
     mandatory = row.get('ОБЯЗАТЕЛЬНАЯ', '').strip()
     return {
+        'project_id':   project_id,
         'project_name': project_name,
         'file_id':      file_id,
         'sheet_name':   sheet_name,
@@ -39,17 +40,18 @@ def _normalize_row(row: dict, sheet_name: str, row_num: int,
 
 UPSERT_SQL = '''
 INSERT INTO work_orders (
-    project_name, file_id, sheet_name, row_num,
+    project_id, project_name, file_id, sheet_name, row_num,
     position, element, quantity, unit_weight, total_weight, payment_sum,
     executor, date_plan, priority, mandatory, status, comment, date_fact,
     drawing_link, updated_at
 ) VALUES (
-    %(project_name)s, %(file_id)s, %(sheet_name)s, %(row_num)s,
+    %(project_id)s, %(project_name)s, %(file_id)s, %(sheet_name)s, %(row_num)s,
     %(position)s, %(element)s, %(quantity)s, %(unit_weight)s, %(total_weight)s, %(payment_sum)s,
     %(executor)s, %(date_plan)s, %(priority)s, %(mandatory)s, %(status)s, %(comment)s, %(date_fact)s,
     %(drawing_link)s, NOW()
 )
 ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
+    project_id   = EXCLUDED.project_id,
     position     = EXCLUDED.position,
     element      = EXCLUDED.element,
     quantity     = EXCLUDED.quantity,
@@ -62,12 +64,9 @@ ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
     mandatory    = EXCLUDED.mandatory,
     drawing_link = EXCLUDED.drawing_link,
     updated_at   = NOW(),
-    status  = CASE WHEN work_orders.status IN ('ВЫПОЛНЕНО','БЛОК')
-                   THEN work_orders.status ELSE EXCLUDED.status END,
-    comment = CASE WHEN work_orders.status IN ('ВЫПОЛНЕНО','БЛОК')
-                   THEN work_orders.comment ELSE EXCLUDED.comment END,
-    date_fact = CASE WHEN work_orders.status IN ('ВЫПОЛНЕНО','БЛОК')
-                     THEN work_orders.date_fact ELSE EXCLUDED.date_fact END
+    status    = EXCLUDED.status,
+    comment   = EXCLUDED.comment,
+    date_fact = EXCLUDED.date_fact
 '''
 
 def run():
@@ -94,7 +93,7 @@ def run():
                 rows = sheets.read_sheet(file_id, sheet_name)
                 synced = 0
                 for i, row in enumerate(rows):
-                    r = _normalize_row(row, sheet_name, i+1, project_name, file_id)
+                    r = _normalize_row(row, sheet_name, i+1, project_name, file_id, f['id'])
                     db.execute(UPSERT_SQL, r)
                     synced += 1
                 total_synced += synced

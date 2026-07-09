@@ -7,7 +7,7 @@ import asyncio
 from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
@@ -340,19 +340,8 @@ def projects_list_kb(projects: list):
     rows = []
     for p in projects:
         status_icon = "🟢" if p['status'] == 'АКТИВНЫЙ' else "📦"
-        total = p.get('total', 0)
-        done = p.get('done', 0)
-        pct = int(done / total * 100) if total else 0
-        if total == 0:
-            progress = "—"
-        elif pct == 100:
-            progress = f"100% ✅"
-        elif pct == 0:
-            progress = f"0% не приступали"
-        else:
-            progress = f"{pct}% в процессе ({done}/{total})"
         rows.append([InlineKeyboardButton(
-            f"{status_icon} {p['project_name']} — {progress}",
+            f"{status_icon} {p['project_name']}",
             callback_data=f"project:detail:{p['id']}"
         )])
     rows.append([InlineKeyboardButton("➕ Добавить проект", callback_data="project:add")])
@@ -456,17 +445,6 @@ async def show_menu(update: Update, worker_name: str, specialization: str,
 
 async def show_projects(update: Update, edit: bool = False):
     projects = get_projects()
-    # Load stats for each project
-    for p in projects:
-        stat = db.fetchone(
-            """SELECT COUNT(*) AS total,
-                      COUNT(*) FILTER (WHERE status='ВЫПОЛНЕНО') AS done
-               FROM work_orders WHERE project_id=%s""",
-            [p['id']]
-        )
-        p['total'] = stat['total'] if stat else 0
-        p['done'] = stat['done'] if stat else 0
-
     active = [p for p in projects if p['status'] == 'АКТИВНЫЙ']
     archived = [p for p in projects if p['status'] != 'АКТИВНЫЙ']
     lines = ["🗂 Управление проектами\n"]
@@ -982,7 +960,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("unblock:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone(
-            "SELECT position, element, executor, sheet_name FROM work_orders WHERE id=%s AND status='БЛОК'",
+            "SELECT position, element, executor, sheet_name, file_id, row_num FROM work_orders WHERE id=%s AND status='БЛОК'",
             [task_id]
         )
         if not task:
@@ -995,7 +973,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [task_id]
         )
 
-        # 2. Редактируем сообщение мастера — убираем кнопку, меняем статус
+        # 2. Обновляем статус в Google Sheets
+        try:
+            if task.get('file_id') and task.get('row_num'):
+                await asyncio.get_event_loop().run_in_executor(
+                    None, update_task_status,
+                    task['file_id'], task['sheet_name'], task['row_num'], 'ПЛАН', None, None
+                )
+        except Exception as e:
+            app_logger.error(f"unblock sheets update error: {e}")
+
+        # 3. Редактируем сообщение мастера — убираем кнопку, меняем статус
         new_text = (
             f"✅ Блок снят\n\n"
             f"Элемент: {task['element'] or '—'}\n"
@@ -1026,10 +1014,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         app_logger.audit('unblock', user.id, user.username, {'task_id': task_id}, 'success')
 
-        # Если остались ещё блоки — показываем обновлённый список
+        # Показываем обновлённый список блоков или меню если блоков больше нет
         remaining = get_all_blocked()
+        await query.answer("Блок снят.")
         if remaining and is_master(role):
-            await query.answer("Блок снят.")
+            lines = [f"🚫 Активные блоки — {len(remaining)} шт\n"]
+            for b in remaining:
+                when = b['updated_at'].strftime('%d.%m %H:%M') if b['updated_at'] else '—'
+                lines.append(
+                    f"• [{b['sheet_name']}] {b['position']} — {b['element'] or '—'}\n"
+                    f"  👷 {b['executor']} | 📁 {b['project_name']}\n"
+                    f"  💬 {b['comment'] or '—'} | 🕐 {when}"
+                )
+            buttons = []
+            for b in remaining:
+                label = f"✅ Снять: {b['position']} — {b['element'] or ''} ({b['sheet_name']})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"unblock:{b['id']}")])
+            buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="\n\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            await show_menu(update, worker_name, specialization, role, edit=False)
 
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
@@ -1194,6 +1202,15 @@ def main():
     app.add_handler(project_conv)
     app.add_handler(CallbackQueryHandler(on_callback))
 
+    async def post_init(app):
+        await app.bot.set_chat_menu_button(
+            menu_button=MenuButtonCommands()
+        )
+        await app.bot.set_my_commands([
+            BotCommand('start', 'Открыть меню'),
+        ])
+
+    app.post_init = post_init
     app_logger.info(f"Bot started. TEST_MODE={config.TEST_MODE}")
     app.run_polling(drop_pending_updates=True)
 
