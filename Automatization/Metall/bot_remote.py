@@ -167,6 +167,7 @@ def get_active_tasks(worker_name: str, specialization: str):
                   date_plan, priority, mandatory, status, drawing_link
            FROM work_orders
            WHERE executor=%s AND sheet_name=%s AND status='ПЛАН'
+             AND (date_plan = CURRENT_DATE OR (mandatory = true AND date_plan < CURRENT_DATE))
            ORDER BY mandatory DESC, priority ASC NULLS LAST, position""",
         [worker_name, specialization]
     )
@@ -228,9 +229,9 @@ async def notify_assembly_workers(bot, project_name: str, element: str):
             )
             sent = await bot.send_message(chat_id=chat.id, text=text)
             db.execute(
-                """INSERT INTO notifications (employee_id, type, message, telegram_message_id)
-                   VALUES (%s, 'ASSEMBLY_READY', %s, %s)""",
-                [emp['id'], text, sent.message_id]
+                """INSERT INTO notifications (tg_user_id, notif_type, message_id)
+                   VALUES (%s, 'ASSEMBLY_READY', %s)""",
+                [chat.id, sent.message_id]
             )
         except Exception as e:
             app_logger.error(f"notify_assembly error for {w['executor']}: {e}")
@@ -303,9 +304,9 @@ async def notify_masters(bot, task_id: int, worker_name: str, specialization: st
             ]])
             sent = await bot.send_message(chat_id=chat.id, text=text, reply_markup=kb)
             db.execute(
-                """INSERT INTO notifications (employee_id, type, work_order_id, message, telegram_message_id)
-                   VALUES (%s, 'BLOCK_ALERT', %s, %s, %s)""",
-                [master['id'], task_id, text, sent.message_id]
+                """INSERT INTO notifications (tg_user_id, notif_type, work_order_id, message_id)
+                   VALUES (%s, 'BLOCK_ALERT', %s, %s)""",
+                [chat.id, task_id, sent.message_id]
             )
         except Exception as e:
             app_logger.error(f"notify_masters error for @{master['telegram_username']}: {e}")
@@ -322,6 +323,7 @@ def main_menu_kb(role: str = ''):
                 InlineKeyboardButton("🗂 Проекты", callback_data="projects"),
                 InlineKeyboardButton("🚫 Блоки", callback_data="master:blocks"),
             ],
+            [InlineKeyboardButton("📅 Планы на сегодня", callback_data="master:plans")],
             [InlineKeyboardButton("📊 Выработка", callback_data="earnings:today")],
             [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
         ]
@@ -618,6 +620,58 @@ def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return worker_name, specialization, role
 
 
+SHEET_ICONS = {
+    'ПЛАЗМА': '🔥', 'ПИЛА': '🪚', 'СВЕРЛЕНИЕ': '🔩',
+    'СБОРКА': '🔧', 'СВАРКА': '⚡', 'ПОКРАСКА': '🎨',
+}
+
+async def show_plans_today(update: Update, edit: bool = False):
+    STATUS_ICON = {'ПЛАН': '⏳', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '🚫'}
+
+    rows = db.fetchall(
+        """SELECT sheet_name, executor, position, element, quantity, status, date_plan,
+                  (date_plan < CURRENT_DATE AND mandatory = true) AS overdue
+           FROM work_orders
+           WHERE date_plan = CURRENT_DATE
+              OR (mandatory = true AND date_plan < CURRENT_DATE AND status = 'ПЛАН')
+           ORDER BY sheet_name, executor,
+                    CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 ELSE 2 END,
+                    date_plan, position""",
+        []
+    )
+    if not rows:
+        text = chr(10).join(["📅 Планы на сегодня", "", "Нет задач на сегодня."])
+    else:
+        from collections import defaultdict
+        by_sheet = defaultdict(lambda: defaultdict(list))
+        for r in rows:
+            by_sheet[r['sheet_name']][r['executor']].append(r)
+
+        lines = [f"📅 Планы на сегодня — {date.today().strftime('%d.%m')}"]
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА']
+        for sheet in SHEET_ORDER:
+            if sheet not in by_sheet:
+                continue
+            icon = SHEET_ICONS.get(sheet, '🔧')
+            lines.append("")
+            lines.append(f"{icon} {sheet}")
+            for executor, tasks in by_sheet[sheet].items():
+                lines.append(f"  👷 {executor}")
+                for t in tasks:
+                    qty = f" × {int(t['quantity'])}" if t['quantity'] else ""
+                    elem = f" ({t['element']})" if t['element'] else ""
+                    sicon = STATUS_ICON.get(t['status'], '⏳')
+                    overdue_mark = f" (от {t['date_plan'].strftime('%d.%m')})" if t.get('overdue') else ""
+                    lines.append(f"    {sicon} {t['position']}{elem}{qty}{overdue_mark}")
+        text = chr(10).join(lines)
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Главное меню", callback_data="menu")]])
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=kb)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -629,8 +683,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Сессия устарела. Нажмите /start")
         return
 
+    app_logger.audit('button', user.id, user.username, {'data': data})
+
     if data == "menu":
         await show_menu(update, worker_name, specialization, role, edit=True)
+
+    elif data == "master:plans":
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        await show_plans_today(update, edit=True)
 
     elif data == "projects":
         if not is_master(role):
