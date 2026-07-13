@@ -55,11 +55,37 @@ def find_folder_by_element(folder_map, element_code):
         for token in folder_name.split():
             if _norm_elem(token) == elem_norm:
                 return folder_name, files
+            # Handle "К1,2" pattern meaning "К1 and К2"
+            m = re.match(r'^([А-Яа-яA-Za-z]+)(\d+),(\d+)$', token)
+            if m:
+                letters, d1, d2 = m.group(1), m.group(2), m.group(3)
+                if elem_norm in (_norm_elem(letters + d1), _norm_elem(letters + d2)):
+                    return folder_name, files
+        # Element as substring of last token fallback
         if folder_name.split():
             last = folder_name.split()[-1]
             if elem_norm in _norm_elem(last):
                 return folder_name, files
     return None, []
+
+
+def _match_file(f, name_norm, length_str):
+    """Returns True if file matches the normalized part name (and optional length)."""
+    fname = f['name']
+    if fname.lower().endswith('.png'):
+        fname = fname[:-4]
+    prefix = fname.split(' _ ')[0].strip() if ' _ ' in fname else fname
+    m_file_len = re.search(r'\s+[Ll]=([0-9,\.]+)\s*$', prefix)
+    if m_file_len:
+        file_len = m_file_len.group(1)
+        file_base = prefix[:m_file_len.start()].strip()
+    else:
+        file_len = None
+        file_base = prefix
+    if _norm_part(file_base) == name_norm:
+        if not length_str or not file_len or length_str == file_len:
+            return True
+    return False
 
 
 def find_file_by_name(files, part_name):
@@ -69,23 +95,23 @@ def find_file_by_name(files, part_name):
     name_norm = _norm_part(clean_name)
 
     for f in files:
-        fname = f['name']
-        if fname.lower().endswith('.png'):
-            fname = fname[:-4]
-        prefix = fname.split(' _ ')[0].strip() if ' _ ' in fname else fname
-        m_file_len = re.search(r'\s+[Ll]=([0-9,\.]+)\s*$', prefix)
-        if m_file_len:
-            file_len = m_file_len.group(1)
-            file_base = prefix[:m_file_len.start()].strip()
-        else:
-            file_len = None
-            file_base = prefix
-        file_base_norm = _norm_part(file_base)
-
-        if file_base_norm == name_norm:
-            if not length_str or not file_len or length_str == file_len:
-                return f
+        if _match_file(f, name_norm, length_str):
+            return f
     return None
+
+
+def find_file_global(folder_map, part_name):
+    """Fallback: ищет файл по всем папкам (когда элемент указан неверно)."""
+    m_len = re.search(r'\(([0-9,\.]+)\)\s*$', part_name)
+    length_str = m_len.group(1) if m_len else None
+    clean_name = re.sub(r'\s*\([^)]*\)\s*$', '', part_name).strip()
+    name_norm = _norm_part(clean_name)
+
+    for folder_name, files in folder_map.items():
+        for f in files:
+            if _match_file(f, name_norm, length_str):
+                return folder_name, f
+    return None, None
 
 
 def find_assembly_file(files):
@@ -142,14 +168,27 @@ def process_sheet(ws, folder_map, sheet_type, dry_run=False):
             folder_name, folder_files = find_folder_by_element(folder_map, elem)
             if folder_files:
                 file_obj = find_file_by_name(folder_files, name)
+                if not file_obj:
+                    # Fallback: search globally across all folders
+                    global_folder, file_obj = find_file_global(folder_map, name)
+                    if file_obj:
+                        print(f'      [fallback] row {row_idx}: "{name}" found in "{global_folder}" (elem="{elem}"→"{folder_name}")')
                 if file_obj:
                     col_letter = chr(65 + link_col_idx)
                     updates.append({'range': f'{col_letter}{row_idx}', 'values': [[make_url(file_obj['id'])]]})
                     matched += 1
                 else:
-                    unmatched.append(f'row {row_idx}: no file "{name}" in folder "{folder_name}"')
+                    unmatched.append(f'row {row_idx}: no file "{name}" in any folder (elem="{elem}")')
             else:
-                unmatched.append(f'row {row_idx}: no folder for element "{elem}"')
+                # No folder matched by element, try global search
+                global_folder, file_obj = find_file_global(folder_map, name)
+                if file_obj:
+                    print(f'      [fallback] row {row_idx}: "{name}" found in "{global_folder}" (elem="{elem}" unmatched)')
+                    col_letter = chr(65 + link_col_idx)
+                    updates.append({'range': f'{col_letter}{row_idx}', 'values': [[make_url(file_obj['id'])]]})
+                    matched += 1
+                else:
+                    unmatched.append(f'row {row_idx}: no folder for element "{elem}", file not found globally')
         else:
             elem_code = name
             folder_name, folder_files = find_folder_by_element(folder_map, elem_code)
