@@ -368,7 +368,7 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     multi_spec = len({t['sheet_name'] for t in tasks}) > 1
     for t in tasks:
         if not t.get('deps_ready', True):
-            prefix = "⏳ "
+            prefix = "☐ "
         elif t['mandatory']:
             prefix = "❗ "
         elif mandatory_left:
@@ -386,7 +386,7 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
 
     for t in blocked:
         spec_tag = f"[{t['sheet_name']}] " if len({b['sheet_name'] for b in blocked}) > 1 else ""
-        label = f"🚫 {spec_tag}{t['position']} — {t['element'] or ''} (заблок.)"
+        label = f"⛔ {spec_tag}{t['position']} — {t['element'] or ''} (заблок.)"
         buttons.append([InlineKeyboardButton(label, callback_data="blocked_info")])
 
     buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
@@ -401,10 +401,10 @@ def task_detail_kb(task_id: int, has_drawing: bool = False, qty_total=None, qty_
     done_label = "✅ Выполнено" + (f" ({qty_remaining} шт.)" if qty_remaining else "")
     rows.append([
         InlineKeyboardButton(done_label, callback_data=f"done:{task_id}"),
-        InlineKeyboardButton("🌗 Частично", callback_data=f"partial_ask:{task_id}"),
+        InlineKeyboardButton("◧ Частично", callback_data=f"partial_ask:{task_id}"),
     ])
     rows.append([
-        InlineKeyboardButton("🚫 БЛОК", callback_data=f"block_ask:{task_id}"),
+        InlineKeyboardButton("⛔ БЛОК", callback_data=f"block_ask:{task_id}"),
         InlineKeyboardButton("← К задачам", callback_data="tasks"),
     ])
     return InlineKeyboardMarkup(rows)
@@ -534,7 +534,7 @@ async def show_tasks(update: Update, worker_name: str, specialization: str = Non
             lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if blocked:
-        lines.append("\n🚫 Заблокированные (снимает руководитель):")
+        lines.append("\n⛔ Заблокированные (снимает руководитель):")
         for t in blocked:
             comment = f" — {t['comment']}" if t['comment'] else ""
             lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
@@ -652,7 +652,7 @@ SHEET_ICONS = {
 }
 
 async def show_plans_today(update: Update, edit: bool = False):
-    STATUS_ICON = {'ПЛАН': '⏳', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '🚫', 'ЧАСТИЧНО': '🌗'}
+    STATUS_ICON = {'ПЛАН': '☐', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '⛔', 'ЧАСТИЧНО': '◧'}
 
     rows = db.fetchall(
         """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
@@ -690,7 +690,7 @@ async def show_plans_today(update: Update, edit: bool = False):
                     for t in tasks:
                         qty = f" × {int(t['quantity'])}" if t['quantity'] else ""
                         elem = f" ({t['element']})" if t['element'] else ""
-                        sicon = STATUS_ICON.get(t['status'], '⏳')
+                        sicon = STATUS_ICON.get(t['status'], '☐')
                         overdue_mark = f" (от {t['date_plan'].strftime('%d.%m')})" if t.get('overdue') else ""
                         lines.append(f"      {sicon} {t['position']}{elem}{qty}{overdue_mark}")
         text = chr(10).join(lines)
@@ -920,7 +920,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if specialization.upper() == 'СБОРКА' and not _deps_ready(task['project_name'], task['element']):
             await query.answer(
-                f"⏳ Ожидает готовности деталей.\nЗавершите позиции ПЛАЗМА/ПИЛА по этому элементу.",
+                f"☐ Ожидает готовности деталей.\nЗавершите позиции ПЛАЗМА/ПИЛА по этому элементу.",
                 show_alert=True
             )
             return
@@ -1001,7 +1001,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = qty_total - qty_done_already
         context.user_data['partial_task_id'] = task_id
         await query.edit_message_text(
-            f"🌗 Частичное выполнение\n\n"
+            f"◧ Частичное выполнение\n\n"
             f"Позиция: {task['position']} — {task['element'] or ''}\n"
             f"Всего: {qty_total} шт | Осталось: {remaining} шт\n\n"
             f"Сколько выполнили? (от 1 до {remaining})"
@@ -1159,7 +1159,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         el  = task['element'] if task else ''
         await query.edit_message_text(
             f"Вы уверены, что хотите заблокировать задачу?\n\n"
-            f"🚫 {pos} — {el}\n\n"
+            f"⛔ {pos} — {el}\n\n"
             f"Снять блокировку сможет только руководитель.",
             reply_markup=confirm_block_kb(task_id)
         )
@@ -1168,7 +1168,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id = int(data.split(":")[1])
         context.user_data['block_task_id'] = task_id
         await query.edit_message_text(
-            "🚫 Укажите причину блокировки:\n(напишите ответным сообщением)"
+            "⛔ Укажите причину блокировки:\n(напишите ответным сообщением)"
         )
         return WAITING_BLOCK_COMMENT
 
@@ -1222,7 +1222,7 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         status_to_write = 'ЧАСТИЧНО'
         remaining = qty_total - qty_done_total
-        msg = (f"🌗 {task['position']} — {task['element'] or ''}\n"
+        msg = (f"◧ {task['position']} — {task['element'] or ''}\n"
                f"Выполнено: {qty_done_total}/{qty_total} шт | Остаток: {remaining} шт")
         sheet_comment = f"Выполнено {qty_done_total} из {qty_total}"
         sheet_date = None
@@ -1298,7 +1298,7 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 3. В историю чата — новое сообщение
     await update.message.reply_text(
-        f"🚫 {pos} — {el}\nЗаблокировано | {TODAY()}\nПричина: {comment}{pay}",
+        f"⛔ {pos} — {el}\nЗаблокировано | {TODAY()}\nПричина: {comment}{pay}",
         reply_markup=back_to_tasks_kb()
     )
     return ConversationHandler.END
