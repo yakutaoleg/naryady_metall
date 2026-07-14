@@ -61,13 +61,12 @@ ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
     executor     = EXCLUDED.executor,
     date_plan    = EXCLUDED.date_plan,
     priority     = EXCLUDED.priority,
-    mandatory    = CASE WHEN work_orders.status = 'ЧАСТИЧНО' THEN true
+    mandatory    = CASE WHEN EXCLUDED.status = 'ЧАСТИЧНО' THEN true
                         ELSE EXCLUDED.mandatory END,
     drawing_link = EXCLUDED.drawing_link,
     updated_at   = NOW(),
-    status    = CASE WHEN work_orders.status IN ('ЧАСТИЧНО','ВЫПОЛНЕНО','БЛОК')
-                     THEN work_orders.status ELSE EXCLUDED.status END,
-    qty_done  = work_orders.qty_done,
+    status    = EXCLUDED.status,
+    qty_done  = CASE WHEN EXCLUDED.status = 'ПЛАН' THEN NULL ELSE work_orders.qty_done END,
     comment   = EXCLUDED.comment,
     date_fact = EXCLUDED.date_fact
 '''
