@@ -161,19 +161,19 @@ def get_earnings(period: str):
     )
 
 
-def get_active_tasks(worker_name: str, specialization: str):
+def get_active_tasks(worker_name: str, specialization: str = None):
     tasks = db.fetchall(
         """SELECT id, project_name, sheet_name, file_id, row_num, position, element,
                   quantity, qty_done, unit_weight, total_weight, payment_sum,
                   date_plan, priority, mandatory, status, drawing_link
            FROM work_orders
-           WHERE executor=%s AND sheet_name=%s AND status IN ('ПЛАН','ЧАСТИЧНО')
+           WHERE executor=%s AND status IN ('ПЛАН','ЧАСТИЧНО')
              AND (date_plan = CURRENT_DATE OR (mandatory = true AND date_plan < CURRENT_DATE))
-           ORDER BY mandatory DESC, priority ASC NULLS LAST, position""",
-        [worker_name, specialization]
+           ORDER BY mandatory DESC, sheet_name, priority ASC NULLS LAST, position""",
+        [worker_name]
     )
     for t in tasks:
-        if specialization.upper() == 'СБОРКА':
+        if t['sheet_name'].upper() == 'СБОРКА':
             t['deps_ready'] = _deps_ready(t['project_name'], t['element'])
         else:
             t['deps_ready'] = True
@@ -238,24 +238,24 @@ async def notify_assembly_workers(bot, project_name: str, element: str):
             app_logger.error(f"notify_assembly error for {w['executor']}: {e}")
 
 
-def get_blocked_tasks(worker_name: str, specialization: str):
+def get_blocked_tasks(worker_name: str, specialization: str = None):
     return db.fetchall(
-        """SELECT id, position, element, quantity, comment
+        """SELECT id, position, element, quantity, comment, sheet_name
            FROM work_orders
-           WHERE executor=%s AND sheet_name=%s AND status='БЛОК'
-           ORDER BY position""",
-        [worker_name, specialization]
+           WHERE executor=%s AND status='БЛОК'
+           ORDER BY sheet_name, position""",
+        [worker_name]
     )
 
 
-def get_done_today(worker_name: str, specialization: str):
+def get_done_today(worker_name: str, specialization: str = None):
     return db.fetchall(
-        """SELECT id, position, element, quantity, payment_sum
+        """SELECT id, position, element, quantity, payment_sum, sheet_name
            FROM work_orders
-           WHERE executor=%s AND sheet_name=%s
+           WHERE executor=%s
              AND status='ВЫПОЛНЕНО' AND date_fact=CURRENT_DATE
-           ORDER BY position""",
-        [worker_name, specialization]
+           ORDER BY sheet_name, position""",
+        [worker_name]
     )
 
 
@@ -270,12 +270,12 @@ def get_tariff(work_type: str, unit_weight):
     )
 
 
-def mandatory_remaining(worker_name: str, specialization: str):
+def mandatory_remaining(worker_name: str, specialization: str = None):
     rows = db.fetchall(
         """SELECT position FROM work_orders
-           WHERE executor=%s AND sheet_name=%s AND mandatory=true AND status='ПЛАН'
+           WHERE executor=%s AND mandatory=true AND status='ПЛАН'
            ORDER BY position""",
-        [worker_name, specialization]
+        [worker_name]
     )
     return [r['position'] for r in rows]
 
@@ -365,6 +365,7 @@ def project_detail_kb(project_id: int, status: str):
 
 def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     buttons = []
+    multi_spec = len({t['sheet_name'] for t in tasks}) > 1
     for t in tasks:
         if not t.get('deps_ready', True):
             prefix = "⏳ "
@@ -379,11 +380,13 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
             qty_str = f"{int(t['quantity'] - qty_done_val)} (ост.)"
         else:
             qty_str = str(int(t['quantity'])) if t['quantity'] else '?'
-        label = f"{prefix}{t['position']} — {t['element'] or ''} × {qty_str}"
+        spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
+        label = f"{prefix}{spec_tag}{t['position']} — {t['element'] or ''} × {qty_str}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"task:{t['id']}")])
 
     for t in blocked:
-        label = f"🚫 {t['position']} — {t['element'] or ''} (заблок.)"
+        spec_tag = f"[{t['sheet_name']}] " if len({b['sheet_name'] for b in blocked}) > 1 else ""
+        label = f"🚫 {spec_tag}{t['position']} — {t['element'] or ''} (заблок.)"
         buttons.append([InlineKeyboardButton(label, callback_data="blocked_info")])
 
     buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
@@ -497,11 +500,11 @@ async def show_earnings(update: Update, period: str = 'today', edit: bool = Fals
         await msg.reply_text(text, reply_markup=kb)
 
 
-async def show_tasks(update: Update, worker_name: str, specialization: str,
+async def show_tasks(update: Update, worker_name: str, specialization: str = None,
                      bot=None, chat_id=None):
-    tasks   = get_active_tasks(worker_name, specialization)
-    blocked = get_blocked_tasks(worker_name, specialization)
-    mandatory_left = mandatory_remaining(worker_name, specialization)
+    tasks   = get_active_tasks(worker_name)
+    blocked = get_blocked_tasks(worker_name)
+    mandatory_left = mandatory_remaining(worker_name)
 
     if not tasks and not blocked:
         text = f"🎉 Все задачи выполнены!\n📅 {TODAY()}"
@@ -513,19 +516,22 @@ async def show_tasks(update: Update, worker_name: str, specialization: str,
 
     mandatory_tasks = [t for t in tasks if t['mandatory']]
     optional_tasks  = [t for t in tasks if not t['mandatory']]
+    multi_spec = len({t['sheet_name'] for t in tasks}) > 1
 
-    lines = [f"📋 Задачи на сегодня | {specialization}", f"📅 {TODAY()}\n"]
+    lines = [f"📋 Задачи на сегодня", f"📅 {TODAY()}\n"]
 
     if mandatory_tasks:
         lines.append("❗ Обязательные:")
         for t in mandatory_tasks:
-            lines.append(f"  • {t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
+            spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
+            lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if optional_tasks:
         lock = " 🔒 (после обязательных)" if mandatory_left else ""
         lines.append(f"\nОстальные{lock}:")
         for t in optional_tasks:
-            lines.append(f"  • {t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
+            spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
+            lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if blocked:
         lines.append("\n🚫 Заблокированные (снимает руководитель):")
