@@ -401,7 +401,7 @@ def task_detail_kb(task_id: int, has_drawing: bool = False, qty_total=None, qty_
     done_label = "✅ Выполнено" + (f" ({qty_remaining} шт.)" if qty_remaining else "")
     rows.append([
         InlineKeyboardButton(done_label, callback_data=f"done:{task_id}"),
-        InlineKeyboardButton("⚡ Частично", callback_data=f"partial_ask:{task_id}"),
+        InlineKeyboardButton("🌗 Частично", callback_data=f"partial_ask:{task_id}"),
     ])
     rows.append([
         InlineKeyboardButton("🚫 БЛОК", callback_data=f"block_ask:{task_id}"),
@@ -652,7 +652,7 @@ SHEET_ICONS = {
 }
 
 async def show_plans_today(update: Update, edit: bool = False):
-    STATUS_ICON = {'ПЛАН': '⏳', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '🚫', 'ЧАСТИЧНО': '⚡'}
+    STATUS_ICON = {'ПЛАН': '⏳', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '🚫', 'ЧАСТИЧНО': '🌗'}
 
     rows = db.fetchall(
         """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
@@ -1001,7 +1001,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = qty_total - qty_done_already
         context.user_data['partial_task_id'] = task_id
         await query.edit_message_text(
-            f"⚡ Частичное выполнение\n\n"
+            f"🌗 Частичное выполнение\n\n"
             f"Позиция: {task['position']} — {task['element'] or ''}\n"
             f"Всего: {qty_total} шт | Осталось: {remaining} шт\n\n"
             f"Сколько выполнили? (от 1 до {remaining})"
@@ -1222,7 +1222,7 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         status_to_write = 'ЧАСТИЧНО'
         remaining = qty_total - qty_done_total
-        msg = (f"⚡ {task['position']} — {task['element'] or ''}\n"
+        msg = (f"🌗 {task['position']} — {task['element'] or ''}\n"
                f"Выполнено: {qty_done_total}/{qty_total} шт | Остаток: {remaining} шт")
         sheet_comment = f"Выполнено {qty_done_total} из {qty_total}"
         sheet_date = None
