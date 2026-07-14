@@ -652,16 +652,17 @@ SHEET_ICONS = {
 }
 
 async def show_plans_today(update: Update, edit: bool = False):
-    STATUS_ICON = {'ПЛАН': '⏳', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '🚫'}
+    STATUS_ICON = {'ПЛАН': '⏳', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '🚫', 'ЧАСТИЧНО': '⚡'}
 
     rows = db.fetchall(
-        """SELECT sheet_name, executor, position, element, quantity, status, date_plan,
+        """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
                   (date_plan < CURRENT_DATE AND mandatory = true) AS overdue
            FROM work_orders
-           WHERE date_plan = CURRENT_DATE
-              OR (mandatory = true AND date_plan < CURRENT_DATE AND status = 'ПЛАН')
-           ORDER BY sheet_name, executor,
-                    CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 ELSE 2 END,
+           WHERE executor IS NOT NULL AND executor != ''
+             AND (date_plan = CURRENT_DATE
+              OR (mandatory = true AND date_plan < CURRENT_DATE AND status = 'ПЛАН'))
+           ORDER BY project_name, sheet_name, executor,
+                    CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 WHEN 'ЧАСТИЧНО' THEN 2 ELSE 3 END,
                     date_plan, position""",
         []
     )
@@ -669,26 +670,29 @@ async def show_plans_today(update: Update, edit: bool = False):
         text = chr(10).join(["📅 Планы на сегодня", "", "Нет задач на сегодня."])
     else:
         from collections import defaultdict
-        by_sheet = defaultdict(lambda: defaultdict(list))
+        # project -> sheet -> executor -> [tasks]
+        by_proj = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         for r in rows:
-            by_sheet[r['sheet_name']][r['executor']].append(r)
+            by_proj[r['project_name']][r['sheet_name']][r['executor']].append(r)
 
         lines = [f"📅 Планы на сегодня — {date.today().strftime('%d.%m')}"]
         SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА']
-        for sheet in SHEET_ORDER:
-            if sheet not in by_sheet:
-                continue
-            icon = SHEET_ICONS.get(sheet, '🔧')
+        for proj_name in sorted(by_proj.keys()):
             lines.append("")
-            lines.append(f"{icon} {sheet}")
-            for executor, tasks in by_sheet[sheet].items():
-                lines.append(f"  👷 {executor}")
-                for t in tasks:
-                    qty = f" × {int(t['quantity'])}" if t['quantity'] else ""
-                    elem = f" ({t['element']})" if t['element'] else ""
-                    sicon = STATUS_ICON.get(t['status'], '⏳')
-                    overdue_mark = f" (от {t['date_plan'].strftime('%d.%m')})" if t.get('overdue') else ""
-                    lines.append(f"    {sicon} {t['position']}{elem}{qty}{overdue_mark}")
+            lines.append(f"📁 {proj_name}")
+            for sheet in SHEET_ORDER:
+                if sheet not in by_proj[proj_name]:
+                    continue
+                icon = SHEET_ICONS.get(sheet, '🔧')
+                lines.append(f"  {icon} {sheet}")
+                for executor, tasks in by_proj[proj_name][sheet].items():
+                    lines.append(f"    👷 {executor}")
+                    for t in tasks:
+                        qty = f" × {int(t['quantity'])}" if t['quantity'] else ""
+                        elem = f" ({t['element']})" if t['element'] else ""
+                        sicon = STATUS_ICON.get(t['status'], '⏳')
+                        overdue_mark = f" (от {t['date_plan'].strftime('%d.%m')})" if t.get('overdue') else ""
+                        lines.append(f"      {sicon} {t['position']}{elem}{qty}{overdue_mark}")
         text = chr(10).join(lines)
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Главное меню", callback_data="menu")]])
