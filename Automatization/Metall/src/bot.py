@@ -215,6 +215,169 @@ def _deps_ready(project_name: str, element: str) -> bool:
     return True
 
 
+async def _notify_worker_unblocked(bot, executor: str, position: str, element: str):
+    emp = db.fetchone(
+        "SELECT telegram_username FROM employees WHERE full_name=%s AND is_active=true",
+        [executor]
+    )
+    if not emp or not emp['telegram_username']:
+        return
+    try:
+        chat = await bot.get_chat(f"@{emp['telegram_username']}")
+        await bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"✅ Блокировка снята\n\n"
+                f"Позиция: {position} — {element or ''}\n"
+                f"Можно продолжать работу."
+            ),
+            reply_markup=back_to_tasks_kb()
+        )
+    except Exception as e:
+        app_logger.error(f"_notify_worker_unblocked error for {executor}: {e}")
+
+
+async def _notify_masters_dep_unblocked(bot, project_name: str, waiting_sheet: str,
+                                         position: str, qty_unblocked: int, qty_still_blocked: int):
+    masters = db.fetchall(
+        "SELECT telegram_username FROM employees WHERE role='master' AND is_active=true",
+        []
+    )
+    text = (
+        f"🔔 Автоматическая разблокировка\n\n"
+        f"📁 {project_name}\n"
+        f"Спец: {waiting_sheet} | {position}\n\n"
+        f"✅ {qty_unblocked} шт → ПЛАН (можно работать)\n"
+    )
+    if qty_still_blocked > 0:
+        text += f"⛔ {qty_still_blocked} шт → ещё ждут"
+    for m in masters:
+        if not m['telegram_username']:
+            continue
+        try:
+            chat = await bot.get_chat(f"@{m['telegram_username']}")
+            await bot.send_message(chat_id=chat.id, text=text)
+        except Exception as e:
+            app_logger.error(f"_notify_masters_dep_unblocked error for {m['telegram_username']}: {e}")
+
+
+async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
+                                 completed_position: str, qty_done: int):
+    """Вызывается когда задача перешла в ЧАСТИЧНО или ВЫПОЛНЕНО.
+    Ищет заблокированные задачи следующего уровня и разбивает их."""
+    from src import sheets as _sheets
+    import uuid as _uuid
+
+    waiting_deps = db.fetchall(
+        """SELECT DISTINCT waiting_sheet, element FROM element_dependencies
+           WHERE project_name=%s AND requires_sheet=%s AND requires_position=%s""",
+        [project_name, completed_sheet, completed_position]
+    )
+    if not waiting_deps:
+        return
+
+    for dep in waiting_deps:
+        waiting_sheet = dep['waiting_sheet']
+        element       = dep['element']
+
+        blocked_tasks = db.fetchall(
+            """SELECT id, position, element, quantity, executor, file_id, sheet_name, row_num,
+                      unit_weight, total_weight, payment_sum, drawing_link, date_plan, priority, comment
+               FROM work_orders
+               WHERE project_name=%s AND sheet_name=%s AND element=%s AND status='БЛОК'""",
+            [project_name, waiting_sheet, element]
+        )
+
+        for task in blocked_tasks:
+            qty_blocked  = int(task['quantity'] or 0)
+            qty_unblock  = min(qty_done, qty_blocked)
+            qty_still    = qty_blocked - qty_unblock
+
+            if qty_unblock <= 0:
+                continue
+
+            _uw      = float(task['unit_weight']  or 0)
+            _orig_q  = float(task['quantity']     or 1)
+            _orig_ps = float(task['payment_sum']  or 0)
+
+            _tw_plan  = round(_uw * qty_unblock, 3)             if _uw      else None
+            _ps_plan  = round(_orig_ps / _orig_q * qty_unblock, 2) if _orig_ps else None
+            _tw_block = round(_uw * qty_still, 3)               if _uw      else None
+            _ps_block = round(_orig_ps / _orig_q * qty_still, 2)   if _orig_ps else None
+
+            if qty_still == 0:
+                # Полная разблокировка
+                db.execute(
+                    "UPDATE work_orders SET status='ПЛАН', comment=NULL WHERE id=%s",
+                    [task['id']]
+                )
+                try:
+                    update_task_status(task['file_id'], task['sheet_name'], task['row_num'], 'ПЛАН')
+                    _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОММЕНТАРИЙ', '')
+                except Exception as e:
+                    app_logger.error(f"notify_deps full unblock sheet error: {e}")
+            else:
+                # Частичная — разбиваем: оригинал → ПЛАН×qty_unblock, новый → БЛОК×qty_still
+                new_row_id = str(_uuid.uuid4())
+                db.execute(
+                    """UPDATE work_orders SET status='ПЛАН', comment=NULL,
+                       quantity=%s, total_weight=%s, payment_sum=%s WHERE id=%s""",
+                    [qty_unblock, _tw_plan, _ps_plan, task['id']]
+                )
+                db.execute(
+                    """INSERT INTO work_orders
+                       (project_name, file_id, sheet_name, row_num, row_id,
+                        position, element, quantity, unit_weight, total_weight, payment_sum,
+                        executor, date_plan, priority, mandatory, status, drawing_link, comment)
+                       SELECT project_name, file_id, sheet_name, -%s, %s,
+                              position, element, %s, unit_weight, %s, %s,
+                              executor, date_plan, priority, false, 'БЛОК', drawing_link,
+                              'Ожидает готовности остатка'
+                       FROM work_orders WHERE id=%s""",
+                    [task['id'], new_row_id, qty_still, _tw_block, _ps_block, task['id']]
+                )
+                try:
+                    update_task_status(task['file_id'], task['sheet_name'], task['row_num'], 'ПЛАН')
+                    _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОЛ-ВО', qty_unblock)
+                    _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОММЕНТАРИЙ', '')
+                    if _tw_plan:
+                        _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _tw_plan)
+                    if _ps_plan:
+                        _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_plan)
+                    remainder_data = {
+                        'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': task['position'] or '',
+                        'ЭЛЕМЕНТ':               task['element'] or '',
+                        'КОЛ-ВО':               qty_still,
+                        'МАССА ЕД. (кг)':       _uw if _uw else '',
+                        'МАССА ВСЕХ (кг)':      _tw_block if _tw_block else '',
+                        'СУММА К ОПЛАТЕ':       _ps_block if _ps_block else '',
+                        'СТАТУС':               'БЛОК',
+                        'ОБЯЗАТЕЛЬНАЯ':         'НЕТ',
+                        'ИСПОЛНИТЕЛЬ':          task['executor'] or '',
+                        'ROW_ID':               new_row_id,
+                        'ССЫЛКА НА ЧЕРТЁЖ':    task['drawing_link'] or '',
+                        'КОММЕНТАРИЙ':          'Ожидает готовности остатка',
+                    }
+                    _sheets.insert_remainder_row(task['file_id'], task['sheet_name'], task['row_num'], remainder_data)
+                except Exception as e:
+                    app_logger.error(f"notify_deps split sheet error: {e}")
+
+            # Уведомляем рабочего (если назначен)
+            if task['executor']:
+                try:
+                    await _notify_worker_unblocked(bot, task['executor'], task['position'], task['element'])
+                except Exception as e:
+                    app_logger.error(f"notify_deps worker notify error: {e}")
+
+            # Уведомляем мастеров
+            try:
+                await _notify_masters_dep_unblocked(
+                    bot, project_name, waiting_sheet, task['position'], qty_unblock, qty_still
+                )
+            except Exception as e:
+                app_logger.error(f"notify_deps masters notify error: {e}")
+
+
 async def notify_assembly_workers(bot, project_name: str, element: str):
     """Уведомить сборщиков что детали по элементу готовы."""
     workers = db.fetchall(
@@ -1040,7 +1203,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("done:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone(
-            "SELECT position, element, payment_sum, executor, file_id, sheet_name, row_num, project_name FROM work_orders WHERE id=%s",
+            "SELECT position, element, quantity, payment_sum, executor, file_id, sheet_name, row_num, project_name FROM work_orders WHERE id=%s",
             [task_id]
         )
         if not task or task['executor'] != worker_name:
@@ -1076,6 +1239,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await notify_assembly_workers(context.bot, task['project_name'], task['element'])
                 except Exception as e:
                     app_logger.error(f"notify_assembly_workers error: {e}")
+
+        # 4. Разблокируем зависимые задачи следующего уровня
+        if task.get('position') and task.get('project_name'):
+            try:
+                await notify_deps_unblocked(
+                    context.bot, task['project_name'], task['sheet_name'],
+                    task['position'], int(task['quantity'] or 0)
+                )
+            except Exception as e:
+                app_logger.error(f"notify_deps_unblocked error: {e}")
 
         # 4. Удаляем карточку, затем новым сообщением шлём подтверждение + список
         pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
@@ -1475,7 +1648,7 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
     task = db.fetchone(
         "SELECT position, element, quantity, qty_done, file_id, sheet_name, row_num, row_id, "
         "executor, date_plan, priority, mandatory, drawing_link, comment, payment_sum, "
-        "unit_weight, total_weight FROM work_orders WHERE id=%s",
+        "unit_weight, total_weight, project_name FROM work_orders WHERE id=%s",
         [task_id]
     )
     if not task:
@@ -1609,6 +1782,16 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     app_logger.audit('set_partial', user.id, user.username,
                      {'task_id': task_id, 'qty_done': qty_new}, 'success')
+
+    # Разблокируем зависимые задачи следующего уровня
+    try:
+        await notify_deps_unblocked(
+            context.bot, task['project_name'], task['sheet_name'],
+            task['position'], qty_new
+        )
+    except Exception as e:
+        app_logger.error(f"notify_deps_unblocked (partial) error: {e}")
+
     await update.message.reply_text(msg, reply_markup=back_to_tasks_kb())
     return ConversationHandler.END
 
