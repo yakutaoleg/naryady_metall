@@ -41,9 +41,11 @@ def _download_drawing(file_id: str):
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL))
 
-WAITING_BLOCK_COMMENT = 1
-WAITING_PROJECT_LINK  = 2
-WAITING_PARTIAL_QTY   = 3
+WAITING_BLOCK_COMMENT  = 1
+WAITING_PROJECT_LINK   = 2
+WAITING_PARTIAL_QTY    = 3
+WAITING_EARNINGS_DATE  = 4
+WAITING_CORRECTION_QTY = 5
 TODAY = lambda: date.today().strftime('%d.%m.%Y')
 
 
@@ -143,21 +145,31 @@ def scan_folder_and_register(folder_id: str, created_by: int) -> dict:
     return {'ok': True, 'project_name': project_name, 'id': project['id']}
 
 
-def get_earnings(period: str):
-    if period == 'today':
-        date_filter = "AND date_fact = CURRENT_DATE"
-    elif period == 'week':
-        date_filter = "AND date_fact >= CURRENT_DATE - INTERVAL '7 days'"
-    else:  # month
-        date_filter = "AND date_fact >= date_trunc('month', CURRENT_DATE)"
+def get_earnings_by_date(date_str: str):
     return db.fetchall(
-        f"""SELECT executor, COUNT(*) as tasks_count, SUM(payment_sum) as total
-            FROM work_orders
-            WHERE status='ВЫПОЛНЕНО' AND payment_sum IS NOT NULL
-            {date_filter}
-            GROUP BY executor
-            ORDER BY total DESC NULLS LAST""",
-        []
+        """SELECT COALESCE(NULLIF(executor,''), NULL) as executor,
+                  project_name, sheet_name,
+                  COUNT(*) as tasks_count,
+                  SUM(payment_sum) as total
+           FROM work_orders
+           WHERE status='ВЫПОЛНЕНО' AND payment_sum IS NOT NULL
+             AND date_fact = %s
+           GROUP BY executor, project_name, sheet_name
+           ORDER BY executor NULLS LAST, project_name, sheet_name""",
+        [date_str]
+    )
+
+
+def get_earnings_detail_by_date(date_str: str):
+    return db.fetchall(
+        """SELECT COALESCE(NULLIF(executor,''), NULL) as executor,
+                  project_name, sheet_name,
+                  position, element,
+                  quantity, payment_sum
+           FROM work_orders
+           WHERE status='ВЫПОЛНЕНО' AND date_fact = %s
+           ORDER BY executor NULLS LAST, project_name, sheet_name, position""",
+        [date_str]
     )
 
 
@@ -274,6 +286,7 @@ def mandatory_remaining(worker_name: str, specialization: str = None):
     rows = db.fetchall(
         """SELECT position FROM work_orders
            WHERE executor=%s AND mandatory=true AND status='ПЛАН'
+             AND date_plan IS NOT NULL AND date_plan < CURRENT_DATE
            ORDER BY position""",
         [worker_name]
     )
@@ -295,7 +308,7 @@ async def notify_masters(bot, task_id: int, worker_name: str, specialization: st
                 f"\U0001f6ab Блокировка на позиции\n\n"
                 f"Элемент: {element or '—'}\n"
                 f"Позиция: {position}\n"
-                f"Специализация: {specialization}\n"
+                f"Специализация: {', '.join(specialization) if isinstance(specialization, list) else (specialization or '—')}\n"
                 f"Рабочий: {worker_name}\n"
                 f"Причина: {comment}\n"
                 f"Время: {TODAY()}"
@@ -325,7 +338,8 @@ def main_menu_kb(role: str = ''):
                 InlineKeyboardButton("🚫 Блоки", callback_data="master:blocks"),
             ],
             [InlineKeyboardButton("📅 Планы на сегодня", callback_data="master:plans")],
-            [InlineKeyboardButton("📊 Выработка", callback_data="earnings:today")],
+            [InlineKeyboardButton("🔧 Исправить выполнение", callback_data="correct:workers")],
+            [InlineKeyboardButton("📊 Выработка", callback_data=f"earnings:{date.today().isoformat()}")],
             [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
         ]
     else:
@@ -423,13 +437,59 @@ def back_to_tasks_kb():
     ]])
 
 
-def earnings_period_kb(active: str):
-    periods = [('today', 'Сегодня'), ('week', 'Неделя'), ('month', 'Месяц')]
-    row = []
-    for p, label in periods:
-        mark = "● " if p == active else ""
-        row.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"earnings:{p}"))
-    return InlineKeyboardMarkup([row, [InlineKeyboardButton("← Главное меню", callback_data="menu")]])
+def correct_workers_kb(workers: list):
+    rows = [[InlineKeyboardButton(f"👤 {w}", callback_data=f"correct:tasks:{w}")] for w in workers]
+    rows.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def correct_tasks_kb(tasks: list):
+    rows = []
+    current_group = None
+    for t in tasks:
+        group = (t['project_name'], t['sheet_name'])
+        if group != current_group:
+            current_group = group
+            sheet_icon = SHEET_ICONS.get(t['sheet_name'], '📋')
+            rows.append([InlineKeyboardButton(
+                f"📁 {t['project_name']}  {sheet_icon} {t['sheet_name']}",
+                callback_data="noop"
+            )])
+        icon = '✅' if t['status'] == 'ВЫПОЛНЕНО' else '◧'
+        date_str = t['date_fact'].strftime('%d.%m') if t['date_fact'] else '—'
+        qty = int(t['quantity'] or 0)
+        rows.append([InlineKeyboardButton(
+            f"{icon} {t['position']} × {qty} шт ({date_str})",
+            callback_data=f"correct:action:{t['id']}"
+        )])
+    rows.append([InlineKeyboardButton("← Рабочие", callback_data="correct:workers")])
+    return InlineKeyboardMarkup(rows)
+
+
+def correct_action_kb(task_id: int, executor: str, show_qty: bool = True):
+    rows = []
+    if show_qty:
+        rows.append([InlineKeyboardButton("◧ Исправить количество", callback_data=f"correct:qty:{task_id}")])
+    rows.append([InlineKeyboardButton("❌ Отменить полностью", callback_data=f"correct:cancel:{task_id}")])
+    rows.append([InlineKeyboardButton("← К задачам", callback_data=f"correct:tasks:{executor}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def earnings_date_kb(date_str: str):
+    from datetime import timedelta
+    d = date.fromisoformat(date_str)
+    prev_str = (d - timedelta(days=1)).isoformat()
+    next_str = (d + timedelta(days=1)).isoformat()
+    prev_label = (d - timedelta(days=1)).strftime('← %d.%m')
+    next_label = (d + timedelta(days=1)).strftime('%d.%m →')
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(prev_label, callback_data=f"earnings:{prev_str}"),
+            InlineKeyboardButton(next_label, callback_data=f"earnings:{next_str}"),
+        ],
+        [InlineKeyboardButton("📅 Выбрать дату", callback_data="earnings_pick")],
+        [InlineKeyboardButton("← Главное меню", callback_data="menu")],
+    ])
 
 
 def back_to_menu_kb():
@@ -446,7 +506,7 @@ async def show_menu(update: Update, worker_name: str, specialization: str,
                     role: str = '', edit: bool = False):
     text = (
         f"👷 {worker_name}\n"
-        f"🔧 Специализация: {specialization}\n"
+        f"🔧 Специализация: {', '.join(specialization) if isinstance(specialization, list) else (specialization or '—')}\n"
         f"📅 Сегодня: {TODAY()}\n\n"
         f"Выберите действие:"
     )
@@ -478,26 +538,56 @@ async def show_projects(update: Update, edit: bool = False):
         await msg.reply_text(text, reply_markup=kb)
 
 
-async def show_earnings(update: Update, period: str = 'today', edit: bool = False):
-    rows = get_earnings(period)
-    labels = {'today': 'сегодня', 'week': 'за 7 дней', 'month': 'за месяц'}
-    period_label = labels.get(period, period)
+async def show_earnings(update: Update, date_str: str = None, edit: bool = False):
+    from collections import defaultdict
+    if date_str is None:
+        date_str = date.today().isoformat()
+    rows = get_earnings_detail_by_date(date_str)
+    d = date.fromisoformat(date_str)
+    date_label = d.strftime('%d.%m.%Y')
     if not rows:
-        text = f"📊 Выработка {period_label}\n\nДанных пока нет."
+        text = '📊 <b>Выработка за ' + date_label + '</b>\n\nДанных пока нет.'
     else:
-        total_all = sum(float(r['total'] or 0) for r in rows)
-        lines = [f"📊 Выработка {period_label}\n"]
+        result_lines = ['📊 <b>Выработка за ' + date_label + '</b>\n']
+        by_exec = defaultdict(list)
         for r in rows:
-            total = float(r['total'] or 0)
-            lines.append(f"👷 {r['executor']}\n  {r['tasks_count']} поз. — {total:.2f} руб")
-        lines.append(f"\n💵 Итого: {total_all:.2f} руб")
-        text = "\n".join(lines)
-    kb = earnings_period_kb(period)
+            by_exec[r['executor']].append(r)
+        grand_total = 0.0
+        for exec_name, recs in by_exec.items():
+            exec_label = exec_name or 'не указан'
+            result_lines.append('<b>👤 ' + exec_label + '</b>')
+            exec_total = 0.0
+            proj_map = defaultdict(list)
+            for rec in recs:
+                proj_map[rec['project_name']].append(rec)
+            for proj, proj_recs in proj_map.items():
+                result_lines.append('  📁 <i>' + proj + '</i>')
+                sheet_map = defaultdict(list)
+                for rec in proj_recs:
+                    sheet_map[rec['sheet_name']].append(rec)
+                for sn, sheet_recs in sheet_map.items():
+                    icon = SHEET_ICONS.get(sn.upper(), '🔧')
+                    sheet_total = sum(float(r['payment_sum'] or 0) for r in sheet_recs)
+                    result_lines.append('  ' + icon + ' <b>' + sn + '</b>')
+                    for rec in sheet_recs:
+                        pos  = rec['position'] or rec['element'] or '—'
+                        qty  = int(rec['quantity']) if rec['quantity'] and float(rec['quantity']) == int(float(rec['quantity'])) else rec['quantity']
+                        ps   = float(rec['payment_sum'] or 0)
+                        ps_s = f'{ps:.2f} руб' if ps else '—'
+                        result_lines.append('    • ' + pos + ' × ' + str(qty) + ' шт — ' + ps_s)
+                    result_lines.append('    <i>Итого ' + sn + ': ' + f'{sheet_total:.2f}' + ' руб</i>')
+                    exec_total += sheet_total
+            result_lines.append('  <b>Итого ' + exec_label + ': ' + f'{exec_total:.2f}' + ' руб</b>')
+            grand_total += exec_total
+            result_lines.append('')
+        result_lines.append('💰 <b>Итого за день: ' + f'{grand_total:.2f}' + ' руб</b>')
+        text = '\n'.join(result_lines)
+    kb = earnings_date_kb(date_str)
     if edit and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
+        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode='HTML')
     else:
         msg = update.message or update.callback_query.message
-        await msg.reply_text(text, reply_markup=kb)
+        await msg.reply_text(text, reply_markup=kb, parse_mode='HTML')
 
 
 async def show_tasks(update: Update, worker_name: str, specialization: str = None,
@@ -549,7 +639,7 @@ async def show_tasks(update: Update, worker_name: str, specialization: str = Non
 
 
 async def show_task_detail(update: Update, task: dict, specialization: str):
-    tariff = get_tariff(specialization, task.get('unit_weight'))
+    tariff = get_tariff(task.get('sheet_name', ''), task.get('unit_weight'))
 
     lines = []
     mandatory_mark = "❗ " if task['mandatory'] else ""
@@ -899,8 +989,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
-        period = data.split(":")[1]
-        await show_earnings(update, period, edit=True)
+        date_str = data.split(":", 1)[1]
+        await show_earnings(update, date_str, edit=True)
+
+    elif data == "earnings_pick":
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        await query.edit_message_text(
+            '📅 Введите дату в формате ДД.ММ.ГГГГ\n\nНапример: 14.07.2026\n\n/cancel — отмена'
+        )
+        return WAITING_EARNINGS_DATE
 
     elif data == "tasks":
         await show_tasks(update, worker_name, specialization)
@@ -918,7 +1017,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Задача не найдена.", reply_markup=back_to_tasks_kb())
             return
 
-        if specialization.upper() == 'СБОРКА' and not _deps_ready(task['project_name'], task['element']):
+        if task['sheet_name'].upper() == 'СБОРКА' and not _deps_ready(task['project_name'], task['element']):
             await query.answer(
                 f"☐ Ожидает готовности деталей.\nЗавершите позиции ПЛАЗМА/ПИЛА по этому элементу.",
                 show_alert=True
@@ -1024,20 +1123,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None, _download_drawing, m.group(1)
             )
             base_name = f"{task['position']} — {task['element'] or ''}"
-            if mime == 'image/png':
-                await context.bot.send_photo(
-                    chat_id=user.id,
-                    photo=io.BytesIO(file_bytes),
-                    caption=f"🖼 {base_name}"
-                )
-            else:
-                ext = 'jpg' if mime == 'image/jpeg' else 'pdf'
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=io.BytesIO(file_bytes),
-                    filename=f"{base_name}.{ext}",
-                    caption=f"📄 {base_name}"
-                )
+            base_name = f"{task['position']} — {task['element'] or ''}"
+            ext_map = {'image/png': 'png', 'image/jpeg': 'jpg', 'application/pdf': 'pdf'}
+            ext = ext_map.get(mime, 'file')
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=io.BytesIO(file_bytes),
+                filename=f"{base_name}.{ext}",
+                caption=f"📄 {base_name}"
+            )
             app_logger.audit('view_drawing', user.id, user.username, {'task_id': task_id}, 'success')
             # Re-send task card as new message so user doesn't scroll up
             task_full = db.fetchone("SELECT * FROM work_orders WHERE id=%s", [task_id])
@@ -1152,6 +1246,202 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await show_menu(update, worker_name, specialization, role, edit=False)
 
+    elif data == "correct:workers":
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        workers = db.fetchall(
+            """SELECT DISTINCT executor FROM work_orders
+               WHERE status IN ('ВЫПОЛНЕНО', 'ЧАСТИЧНО')
+                 AND date_fact >= CURRENT_DATE - INTERVAL '1 day'
+                 AND executor IS NOT NULL AND executor != ''
+               ORDER BY executor""",
+            []
+        )
+        if not workers:
+            await query.edit_message_text(
+                "Нет выполненных задач за сегодня и вчера.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="menu")]])
+            )
+            return
+        await query.edit_message_text(
+            "🔧 Исправить выполнение\n\nВыберите рабочего:",
+            reply_markup=correct_workers_kb([w['executor'] for w in workers])
+        )
+
+    elif data.startswith("correct:tasks:"):
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        w_name = data[len("correct:tasks:"):]
+        tasks = db.fetchall(
+            """SELECT id, position, element, quantity, qty_done, status, date_fact,
+                      sheet_name, project_name, file_id, row_num
+               FROM work_orders
+               WHERE executor=%s
+                 AND status IN ('ВЫПОЛНЕНО', 'ЧАСТИЧНО')
+                 AND date_fact >= CURRENT_DATE - INTERVAL '1 day'
+               ORDER BY project_name, sheet_name, date_fact DESC, position""",
+            [w_name]
+        )
+        if not tasks:
+            await query.edit_message_text(
+                f"Нет задач у {w_name} за последние 2 дня.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Рабочие", callback_data="correct:workers")]])
+            )
+            return
+        await query.edit_message_text(
+            f"🔧 Исправить выполнение\n👤 {w_name}\n\nВыберите задачу:",
+            reply_markup=correct_tasks_kb(tasks)
+        )
+
+    elif data.startswith("correct:action:"):
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        task_id = int(data.split(":")[2])
+        task = db.fetchone(
+            """SELECT id, position, element, quantity, qty_done, status, date_fact,
+                      sheet_name, project_name, file_id, row_num, executor
+               FROM work_orders WHERE id=%s""",
+            [task_id]
+        )
+        if not task:
+            await query.answer("Задача не найдена.", show_alert=True)
+            return
+        icon = '✅' if task['status'] == 'ВЫПОЛНЕНО' else '◧'
+        date_str = task['date_fact'].strftime('%d.%m.%Y') if task['date_fact'] else '—'
+        qty = int(task['quantity'] or 0)
+        text = (
+            f"{icon} {task['position']}\n"
+            f"Спец: {task['sheet_name']} | Проект: {task['project_name']}\n"
+            f"Исполнитель: {task['executor']}\n"
+            f"Кол-во: {qty} шт | Дата: {date_str}\n"
+            f"Статус: {task['status']}"
+        )
+        # Проверка блокировки: ЧАСТИЧНО, но остаток уже ВЫПОЛНЕНО сегодня
+        if task['status'] == 'ЧАСТИЧНО':
+            completed_remainder = db.fetchone(
+                """SELECT id FROM work_orders
+                   WHERE position=%s AND file_id=%s AND sheet_name=%s
+                     AND status='ВЫПОЛНЕНО' AND date_fact=CURRENT_DATE AND id!=%s
+                   LIMIT 1""",
+                [task['position'], task['file_id'], task['sheet_name'], task_id]
+            )
+            if completed_remainder:
+                text += (
+                    "\n\n⛔ Нельзя исправить — остаток по этой позиции уже выполнен сегодня.\n"
+                    "Сначала исправьте сегодняшнее выполнение."
+                )
+                await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← К задачам", callback_data=f"correct:tasks:{task['executor']}")
+                ]]))
+                return
+        # qty=1 → только отмена (нельзя исправить до 0)
+        show_qty = qty > 1
+        await query.edit_message_text(text, reply_markup=correct_action_kb(task_id, task['executor'], show_qty))
+
+    elif data.startswith("correct:qty:"):
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        task_id = int(data.split(":")[2])
+        task = db.fetchone(
+            "SELECT position, element, quantity, file_id, sheet_name FROM work_orders WHERE id=%s",
+            [task_id]
+        )
+        if not task:
+            await query.answer("Задача не найдена.", show_alert=True)
+            return
+        remainder = db.fetchone(
+            """SELECT id, quantity FROM work_orders
+               WHERE position=%s AND file_id=%s AND sheet_name=%s
+                 AND status='ПЛАН' AND id!=%s
+               ORDER BY id DESC LIMIT 1""",
+            [task['position'], task['file_id'], task['sheet_name'], task_id]
+        )
+        qty_self = int(task['quantity'] or 0)
+        total_original = qty_self + (int(remainder['quantity'] or 0) if remainder else 0)
+        max_qty = total_original - 1
+        context.user_data['correct_task_id']     = task_id
+        context.user_data['correct_max_qty']     = max_qty
+        context.user_data['correct_remainder_id'] = remainder['id'] if remainder else None
+        await query.edit_message_text(
+            f"◧ Исправить количество\n\n"
+            f"Позиция: {task['position']} — {task['element'] or ''}\n"
+            f"Выполнено по записи: {qty_self} шт\n\n"
+            f"Сколько реально сделано? (от 1 до {max_qty})"
+        )
+        return WAITING_CORRECTION_QTY
+
+    elif data.startswith("correct:cancel:"):
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        task_id = int(data.split(":")[2])
+        from src import sheets as _sheets
+        task = db.fetchone(
+            """SELECT id, position, element, quantity, qty_done, status,
+                      file_id, sheet_name, row_num, unit_weight, payment_sum, executor
+               FROM work_orders WHERE id=%s""",
+            [task_id]
+        )
+        if not task:
+            await query.answer("Задача не найдена.", show_alert=True)
+            return
+        remainder = db.fetchone(
+            """SELECT id, quantity, row_num, total_weight, payment_sum FROM work_orders
+               WHERE position=%s AND file_id=%s AND sheet_name=%s
+                 AND status='ПЛАН' AND id!=%s
+               ORDER BY id DESC LIMIT 1""",
+            [task['position'], task['file_id'], task['sheet_name'], task_id]
+        )
+        restored_qty = int(task['quantity'] or 0) + (int(remainder['quantity'] or 0) if remainder else 0)
+        _uw = float(task['unit_weight'] or 0)
+        _done_ps = float(task['payment_sum'] or 0)
+        _rem_ps  = float(remainder['payment_sum'] or 0) if remainder else 0.0
+        _tw_restored = round(_uw * restored_qty, 3) if _uw else None
+        _ps_restored = round(_done_ps + _rem_ps, 2) if (_done_ps or _rem_ps) else None
+        # БД: восстанавливаем оригинальную строку
+        db.execute(
+            """UPDATE work_orders
+               SET status='ПЛАН', qty_done=NULL, date_fact=NULL,
+                   quantity=%s, total_weight=%s, payment_sum=%s
+               WHERE id=%s""",
+            [restored_qty, _tw_restored, _ps_restored, task_id]
+        )
+        # БД: удаляем строку-остаток
+        if remainder:
+            db.execute("DELETE FROM work_orders WHERE id=%s", [remainder['id']])
+        # Лист: обновляем оригинальную строку
+        try:
+            _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СТАТУС', 'ПЛАН')
+            _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'ДАТА ФАКТ', '')
+            _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'ВЫПОЛНЕНО', '')
+            _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОЛ-ВО', restored_qty)
+            if _tw_restored:
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _tw_restored)
+            if _ps_restored:
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_restored)
+        except Exception as e:
+            app_logger.error(f"correct_cancel sheets update error: {e}")
+        # Лист: удаляем строку-остаток
+        if remainder and remainder.get('row_num') and remainder['row_num'] > 0:
+            try:
+                _sheets.delete_row(task['file_id'], task['sheet_name'], remainder['row_num'])
+            except Exception as e:
+                app_logger.error(f"correct_cancel delete row error: {e}")
+        app_logger.audit('master_correct_cancel', user.id, user.username,
+                         {'task_id': task_id, 'restored_qty': restored_qty}, 'success')
+        await query.edit_message_text(
+            f"✅ Отменено\n\n"
+            f"Позиция: {task['position']} — {task['element'] or ''}\n"
+            f"Возвращено в ПЛАН: {restored_qty} шт",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("← К рабочему", callback_data=f"correct:tasks:{task['executor']}")
+            ]])
+        )
+
     elif data.startswith("block_ask:"):
         task_id = int(data.split(":")[1])
         task = db.fetchone("SELECT position, element FROM work_orders WHERE id=%s", [task_id])
@@ -1183,7 +1473,9 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     task = db.fetchone(
-        "SELECT position, element, quantity, qty_done, file_id, sheet_name, row_num FROM work_orders WHERE id=%s",
+        "SELECT position, element, quantity, qty_done, file_id, sheet_name, row_num, row_id, "
+        "executor, date_plan, priority, mandatory, drawing_link, comment, payment_sum, "
+        "unit_weight, total_weight FROM work_orders WHERE id=%s",
         [task_id]
     )
     if not task:
@@ -1197,6 +1489,9 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['partial_task_id'] = task_id
         return WAITING_PARTIAL_QTY
 
+    app_logger.audit('partial_qty_received', user.id, user.username,
+                     {'task_id': task_id, 'qty_entered': qty_new}, 'pending')
+
     qty_total = int(task['quantity'] or 0)
     qty_done_before = int(task['qty_done'] or 0)
     qty_done_total = qty_done_before + qty_new
@@ -1207,43 +1502,247 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['partial_task_id'] = task_id
         return WAITING_PARTIAL_QTY
 
+    today = TODAY()
+    worker_name, specialization, _ = _get_worker_context(update, context)
+    employee = db.fetchone("SELECT id FROM employees WHERE full_name=%s", [worker_name])
+    employee_id = employee['id'] if employee else None
+
+    unit_price = (float(task['payment_sum'] or 0) / float(task['quantity'] or 1)) if task['quantity'] else 0
+    history_payment = round(unit_price * qty_new, 2)
+
+    db.execute(
+        "INSERT INTO work_order_history (work_order_id, row_id, employee_id, qty, payment_sum, date_done) "
+        "VALUES (%s, %s, %s, %s, %s, CURRENT_DATE)",
+        [task_id, task['row_id'], employee_id, qty_new, history_payment]
+    )
+
     if qty_done_total == qty_total:
         db.execute(
             "UPDATE work_orders SET status='ВЫПОЛНЕНО', qty_done=%s, date_fact=CURRENT_DATE WHERE id=%s",
             [qty_done_total, task_id]
         )
-        status_to_write = 'ВЫПОЛНЕНО'
-        msg = f"✅ {task['position']} — {task['element'] or ''}\nВыполнено полностью | {TODAY()}"
-        sheet_comment, sheet_date = None, TODAY()
-    else:
-        db.execute(
-            "UPDATE work_orders SET status='ЧАСТИЧНО', qty_done=%s, mandatory=true WHERE id=%s",
-            [qty_done_total, task_id]
-        )
-        status_to_write = 'ЧАСТИЧНО'
-        remaining = qty_total - qty_done_total
-        msg = (f"◧ {task['position']} — {task['element'] or ''}\n"
-               f"Выполнено: {qty_done_total}/{qty_total} шт | Остаток: {remaining} шт")
-        sheet_comment = f"Выполнено {qty_done_total} из {qty_total}"
-        sheet_date = None
+        try:
+            update_task_status(
+                file_id=task['file_id'], sheet_name=task['sheet_name'], row_num=task['row_num'],
+                status='ВЫПОЛНЕНО', date_fact=today, qty_done=qty_done_total,
+            )
+        except Exception as e:
+            app_logger.error(f"Sheets full-done write error: {e}")
+        msg = f"✅ {task['position']} — {task['element'] or ''}\nВыполнено полностью | {today}"
 
-    try:
-        update_task_status(
-            file_id=task['file_id'],
-            sheet_name=task['sheet_name'],
-            row_num=task['row_num'],
-            status=status_to_write,
-            comment=sheet_comment,
-            date_fact=sheet_date,
-            qty_done=qty_done_total if status_to_write == 'ЧАСТИЧНО' else None,
+    else:
+        import uuid as _uuid
+        remaining = qty_total - qty_done_total
+        new_row_id = str(_uuid.uuid4())
+
+        # Считаем пропорции ДО UPDATE — иначе после quantity=qty_new деление сокращается
+        _orig_qty = float(task['quantity'] or 1)
+        _tw_remain = round(float(task['total_weight'] or 0) / _orig_qty * remaining, 3) if task['total_weight'] else None
+        _ps_remain = round(float(task['payment_sum']  or 0) / _orig_qty * remaining, 2) if task['payment_sum']  else None
+
+        # Текущая строка → ВЫПОЛНЕНО с qty_new шт
+        db.execute(
+            "UPDATE work_orders SET status='ВЫПОЛНЕНО', qty_done=%s, quantity=%s, date_fact=CURRENT_DATE WHERE id=%s",
+            [qty_new, qty_new, task_id]
         )
-    except Exception as e:
-        app_logger.error(f"Sheets partial write error: {e}")
+
+        # Новая строка-остаток в БД (используем заранее вычисленные значения)
+        db.execute(
+            "INSERT INTO work_orders "
+            "(project_name, file_id, sheet_name, row_num, row_id, "
+            " position, element, quantity, unit_weight, total_weight, payment_sum, "
+            " executor, date_plan, priority, mandatory, status, drawing_link) "
+            "SELECT project_name, file_id, sheet_name, -%s, %s, "
+            "       position, element, %s, unit_weight, %s, %s, "
+            "       NULL, date_plan, priority, true, 'ПЛАН', drawing_link "
+            "FROM work_orders WHERE id=%s",
+            [task_id, new_row_id, remaining, _tw_remain, _ps_remain, task_id]
+        )
+
+        try:
+            from src import sheets as _sheets
+            # Текущую строку → ВЫПОЛНЕНО
+            update_task_status(
+                file_id=task['file_id'], sheet_name=task['sheet_name'], row_num=task['row_num'],
+                status='ВЫПОЛНЕНО', date_fact=today, qty_done=qty_new,
+            )
+            # Обновляем КОЛ-ВО, МАССА ВСЕХ, СУММА К ОПЛАТЕ текущей строки
+            _qty = float(task['quantity'] or 1)
+            _sheets.update_cell_by_header(
+                task['file_id'], task['sheet_name'], task['row_num'], 'КОЛ-ВО', qty_new
+            )
+            if task['total_weight']:
+                _tw_done = round(float(task['total_weight']) / _qty * qty_new, 3)
+                _sheets.update_cell_by_header(
+                    task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _tw_done
+                )
+            if task['payment_sum']:
+                _ps_done = round(float(task['payment_sum']) / _qty * qty_new, 2)
+                _sheets.update_cell_by_header(
+                    task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_done
+                )
+            # Вставляем строку-остаток сразу после
+            _uw  = float(task['unit_weight'] or 0) or None
+            _tw  = round(float(task['total_weight'] or 0) / _qty * remaining, 3) if task['total_weight'] else None
+            _ps  = round(float(task['payment_sum']  or 0) / _qty * remaining, 2) if task['payment_sum']  else None
+            remainder_data = {
+                'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': task['position'] or '',
+                'ЭЛЕМЕНТ':               task['element'] or '',
+                'КОЛ-ВО':               remaining,
+                'МАССА ЕД. (кг)':       _uw  if _uw  is not None else '',
+                'МАССА ВСЕХ (кг)':      _tw  if _tw  is not None else '',
+                'СУММА К ОПЛАТЕ':       _ps  if _ps  is not None else '',
+                'СТАТУС':                'ПЛАН',
+                'ОБЯЗАТЕЛЬНАЯ':          'НЕТ',
+                'ИСПОЛНИТЕЛЬ':           '',
+                'ROW_ID':                new_row_id,
+                'ССЫЛКА НА ЧЕРТЁЖ':     task['drawing_link'] or '',
+            }
+            _sheets.insert_remainder_row(
+                task['file_id'], task['sheet_name'], task['row_num'], remainder_data
+            )
+        except Exception as e:
+            app_logger.error(f"Sheets partial split error: {e}")
+
+        msg = (f"◧ {task['position']} — {task['element'] or ''}\n"
+               f"Выполнено: {qty_new} шт | Остаток {remaining} шт добавлен в план")
 
     app_logger.audit('set_partial', user.id, user.username,
-                     {'task_id': task_id, 'qty_done': qty_done_total}, 'success')
-    worker_name, specialization, _ = _get_worker_context(update, context)
+                     {'task_id': task_id, 'qty_done': qty_new}, 'success')
     await update.message.reply_text(msg, reply_markup=back_to_tasks_kb())
+    return ConversationHandler.END
+
+
+async def receive_correction_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    task_id      = context.user_data.pop('correct_task_id', None)
+    max_qty      = context.user_data.pop('correct_max_qty', None)
+    remainder_id = context.user_data.pop('correct_remainder_id', None)
+    text = update.message.text.strip()
+
+    if not task_id:
+        await update.message.reply_text("Ошибка: начните заново с /start")
+        return ConversationHandler.END
+
+    try:
+        qty_new = int(text)
+    except ValueError:
+        await update.message.reply_text("Введите целое число.")
+        context.user_data['correct_task_id']      = task_id
+        context.user_data['correct_max_qty']      = max_qty
+        context.user_data['correct_remainder_id'] = remainder_id
+        return WAITING_CORRECTION_QTY
+
+    if qty_new <= 0 or qty_new > max_qty:
+        await update.message.reply_text(f"Некорректное число. Введите от 1 до {max_qty}.")
+        context.user_data['correct_task_id']      = task_id
+        context.user_data['correct_max_qty']      = max_qty
+        context.user_data['correct_remainder_id'] = remainder_id
+        return WAITING_CORRECTION_QTY
+
+    from src import sheets as _sheets
+    task = db.fetchone(
+        """SELECT id, position, element, quantity, status, date_fact,
+                  file_id, sheet_name, row_num, unit_weight, total_weight, payment_sum, executor, drawing_link
+           FROM work_orders WHERE id=%s""",
+        [task_id]
+    )
+    if not task:
+        await update.message.reply_text("Задача не найдена.")
+        return ConversationHandler.END
+
+    total_original = max_qty + 1
+    new_remaining  = total_original - qty_new
+    _uw = float(task['unit_weight'] or 0)
+
+    # Общая сумма оплаты = текущая + остатка (если есть)
+    _self_ps = float(task['payment_sum'] or 0)
+    _rem_ps_old = 0.0
+    if remainder_id:
+        rem_row = db.fetchone("SELECT quantity, row_num, payment_sum FROM work_orders WHERE id=%s", [remainder_id])
+        _rem_ps_old = float(rem_row['payment_sum'] or 0) if rem_row else 0.0
+    _total_ps = _self_ps + _rem_ps_old
+
+    _done_tw = round(_uw * qty_new, 3)          if _uw        else None
+    _done_ps = round(_total_ps / total_original * qty_new,       2) if _total_ps else None
+    _rem_tw  = round(_uw * new_remaining, 3)     if _uw        else None
+    _rem_ps  = round(_total_ps / total_original * new_remaining, 2) if _total_ps else None
+
+    # БД: обновляем оригинальную строку
+    db.execute(
+        "UPDATE work_orders SET qty_done=%s, quantity=%s, total_weight=%s, payment_sum=%s WHERE id=%s",
+        [qty_new, qty_new, _done_tw, _done_ps, task_id]
+    )
+
+    if remainder_id:
+        # Обновляем существующий остаток
+        db.execute(
+            "UPDATE work_orders SET quantity=%s, total_weight=%s, payment_sum=%s WHERE id=%s",
+            [new_remaining, _rem_tw, _rem_ps, remainder_id]
+        )
+        try:
+            _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОЛ-ВО', qty_new)
+            if _done_tw:
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _done_tw)
+            if _done_ps:
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _done_ps)
+            if rem_row and rem_row.get('row_num') and rem_row['row_num'] > 0:
+                rn = rem_row['row_num']
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], rn, 'КОЛ-ВО', new_remaining)
+                if _rem_tw:
+                    _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], rn, 'МАССА ВСЕХ (кг)', _rem_tw)
+                if _rem_ps:
+                    _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], rn, 'СУММА К ОПЛАТЕ', _rem_ps)
+        except Exception as e:
+            app_logger.error(f"correct_qty sheets update error: {e}")
+    else:
+        # Остатка не было — создаём новый (как в partial flow)
+        import uuid as _uuid
+        new_row_id = str(_uuid.uuid4())
+        db.execute(
+            """INSERT INTO work_orders
+               (project_name, file_id, sheet_name, row_num, row_id,
+                position, element, quantity, unit_weight, total_weight, payment_sum,
+                executor, date_plan, priority, mandatory, status, drawing_link)
+               SELECT project_name, file_id, sheet_name, -%s, %s,
+                      position, element, %s, unit_weight, %s, %s,
+                      NULL, date_plan, priority, false, 'ПЛАН', drawing_link
+               FROM work_orders WHERE id=%s""",
+            [task_id, new_row_id, new_remaining, _rem_tw, _rem_ps, task_id]
+        )
+        try:
+            _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОЛ-ВО', qty_new)
+            if _done_tw:
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _done_tw)
+            if _done_ps:
+                _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _done_ps)
+            remainder_data = {
+                'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': task['position'] or '',
+                'ЭЛЕМЕНТ':               task['element'] or '',
+                'КОЛ-ВО':               new_remaining,
+                'МАССА ЕД. (кг)':       _uw if _uw else '',
+                'МАССА ВСЕХ (кг)':      _rem_tw if _rem_tw else '',
+                'СУММА К ОПЛАТЕ':       _rem_ps if _rem_ps else '',
+                'СТАТУС':               'ПЛАН',
+                'ОБЯЗАТЕЛЬНАЯ':         'НЕТ',
+                'ИСПОЛНИТЕЛЬ':          '',
+                'ROW_ID':               new_row_id,
+                'ССЫЛКА НА ЧЕРТЁЖ':    task['drawing_link'] or '',
+            }
+            _sheets.insert_remainder_row(task['file_id'], task['sheet_name'], task['row_num'], remainder_data)
+        except Exception as e:
+            app_logger.error(f"correct_qty sheets insert error: {e}")
+
+    app_logger.audit('master_correct_qty', user.id, user.username,
+                     {'task_id': task_id, 'qty_new': qty_new, 'new_remaining': new_remaining}, 'success')
+    await update.message.reply_text(
+        f"✅ Исправлено\n\n"
+        f"Позиция: {task['position']} — {task['element'] or ''}\n"
+        f"Выполнено: {qty_new} шт | Остаток: {new_remaining} шт в ПЛАН",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("← К рабочему", callback_data=f"correct:tasks:{task['executor']}")
+        ]])
+    )
     return ConversationHandler.END
 
 
@@ -1349,8 +1848,28 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def receive_earnings_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        parts = text.split('.')
+        if len(parts) != 3:
+            raise ValueError
+        d = date(int(parts[2]), int(parts[1]), int(parts[0]))
+        date_str = d.isoformat()
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            '❌ Неверный формат. Введите дату ДД.ММ.ГГГГ\n\nНапример: 14.07.2026\n\n/cancel — отмена'
+        )
+        return WAITING_EARNINGS_DATE
+    await show_earnings(update, date_str, edit=False)
+    return ConversationHandler.END
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('block_task_id', None)
+    context.user_data.pop('correct_task_id', None)
+    context.user_data.pop('correct_max_qty', None)
+    context.user_data.pop('correct_remainder_id', None)
     await update.message.reply_text("Отменено.", reply_markup=back_to_menu_kb())
     return ConversationHandler.END
 
@@ -1395,11 +1914,79 @@ def main():
         per_message=False,
     )
 
+    earnings_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_callback, pattern=r'^earnings_pick$')],
+        states={
+            WAITING_EARNINGS_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_earnings_date)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cmd_cancel)],
+        per_message=False,
+    )
+
+    correction_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_callback, pattern=r'^correct:qty:\d+$')],
+        states={
+            WAITING_CORRECTION_QTY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_correction_qty)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cmd_cancel)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(partial_conv)
     app.add_handler(block_conv)
     app.add_handler(project_conv)
+    app.add_handler(earnings_conv)
+    app.add_handler(correction_conv)
     app.add_handler(CallbackQueryHandler(on_callback))
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        import traceback
+        err = context.error
+        tb = ''.join(traceback.format_exception(type(err), err, err.__traceback__))
+
+        # Не шумим на "Message is not modified" — это безвредно
+        if 'Message is not modified' in str(err):
+            return
+
+        app_logger.error(f"Unhandled exception: {err}\n{tb}")
+
+        # Сообщение пользователю
+        user_text = (
+            "⚠️ Произошла ошибка. Нажмите /start или кнопку Меню.\n"
+            "При повторении ошибки обратитесь к администратору."
+        )
+        try:
+            if isinstance(update, Update):
+                if update.callback_query:
+                    await update.callback_query.answer()
+                    await update.callback_query.message.reply_text(user_text)
+                elif update.effective_message:
+                    await update.effective_message.reply_text(user_text)
+        except Exception:
+            pass
+
+        # Алерт администратору
+        ADMIN_CHAT_ID = 340620064
+        user_info = ''
+        if isinstance(update, Update) and update.effective_user:
+            u = update.effective_user
+            user_info = f"👤 {u.full_name} (@{u.username})\n"
+        admin_text = (
+            f"🔴 <b>Ошибка в боте</b>\n\n"
+            f"{user_info}"
+            f"<code>{str(err)[:300]}</code>"
+        )
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text, parse_mode='HTML')
+        except Exception:
+            pass
+
+    app.add_error_handler(error_handler)
 
     async def post_init(app):
         await app.bot.set_chat_menu_button(
