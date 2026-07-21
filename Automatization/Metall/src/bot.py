@@ -234,7 +234,7 @@ async def _notify_worker_unblocked(bot, executor: str, position: str, element: s
             reply_markup=back_to_tasks_kb()
         )
     except Exception as e:
-        app_logger.error(f"_notify_worker_unblocked error for {executor}: {e}")
+        app_logger.alert(f"_notify_worker_unblocked error for {executor}: {e}")
 
 
 async def _notify_masters_dep_unblocked(bot, project_name: str, waiting_sheet: str,
@@ -258,7 +258,7 @@ async def _notify_masters_dep_unblocked(bot, project_name: str, waiting_sheet: s
             chat = await bot.get_chat(f"@{m['telegram_username']}")
             await bot.send_message(chat_id=chat.id, text=text)
         except Exception as e:
-            app_logger.error(f"_notify_masters_dep_unblocked error for {m['telegram_username']}: {e}")
+            app_logger.alert(f"_notify_masters_dep_unblocked error for {m['telegram_username']}: {e}")
 
 
 async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
@@ -315,7 +315,7 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                     update_task_status(task['file_id'], task['sheet_name'], task['row_num'], 'ПЛАН')
                     _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'КОММЕНТАРИЙ', '')
                 except Exception as e:
-                    app_logger.error(f"notify_deps full unblock sheet error: {e}")
+                    app_logger.alert(f"notify_deps full unblock sheet error: {e}")
             else:
                 # Частичная — разбиваем: оригинал → ПЛАН×qty_unblock, новый → БЛОК×qty_still
                 new_row_id = str(_uuid.uuid4())
@@ -360,14 +360,14 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                     }
                     _sheets.insert_remainder_row(task['file_id'], task['sheet_name'], task['row_num'], remainder_data)
                 except Exception as e:
-                    app_logger.error(f"notify_deps split sheet error: {e}")
+                    app_logger.alert(f"notify_deps split sheet error: {e}")
 
             # Уведомляем рабочего (если назначен)
             if task['executor']:
                 try:
                     await _notify_worker_unblocked(bot, task['executor'], task['position'], task['element'])
                 except Exception as e:
-                    app_logger.error(f"notify_deps worker notify error: {e}")
+                    app_logger.alert(f"notify_deps worker notify error: {e}")
 
             # Уведомляем мастеров
             try:
@@ -375,7 +375,7 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                     bot, project_name, waiting_sheet, task['position'], qty_unblock, qty_still
                 )
             except Exception as e:
-                app_logger.error(f"notify_deps masters notify error: {e}")
+                app_logger.alert(f"notify_deps masters notify error: {e}")
 
 
 async def notify_assembly_workers(bot, project_name: str, element: str):
@@ -410,7 +410,7 @@ async def notify_assembly_workers(bot, project_name: str, element: str):
                 [chat.id, sent.message_id]
             )
         except Exception as e:
-            app_logger.error(f"notify_assembly error for {w['executor']}: {e}")
+            app_logger.alert(f"notify_assembly error for {w['executor']}: {e}")
 
 
 def get_blocked_tasks(worker_name: str, specialization: str = None):
@@ -486,7 +486,7 @@ async def notify_masters(bot, task_id: int, worker_name: str, specialization: st
                 [chat.id, task_id, sent.message_id]
             )
         except Exception as e:
-            app_logger.error(f"notify_masters error for @{master['telegram_username']}: {e}")
+            app_logger.alert(f"notify_masters error for @{master['telegram_username']}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1096,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=project_detail_kb(project_id, 'АКТИВНЫЙ')
             )
         except Exception as e:
-            app_logger.error(f"sync trigger error: {e}")
+            app_logger.alert(f"sync trigger error: {e}")
             await query.answer("Ошибка запуска синхронизации.", show_alert=True)
 
     elif data.startswith("project:archive:"):
@@ -1228,7 +1228,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 date_fact=today_str
             )
         except Exception as e:
-            app_logger.error(f"Sheets write error: {e}")
+            app_logger.alert(f"Sheets write error: {e}")
 
         app_logger.audit('set_done', user.id, user.username, {'task_id': task_id}, 'success')
 
@@ -1238,7 +1238,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await notify_assembly_workers(context.bot, task['project_name'], task['element'])
                 except Exception as e:
-                    app_logger.error(f"notify_assembly_workers error: {e}")
+                    app_logger.alert(f"notify_assembly_workers error: {e}")
 
         # 4. Разблокируем зависимые задачи следующего уровня
         if task.get('position') and task.get('project_name'):
@@ -1248,7 +1248,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     task['position'], int(task['quantity'] or 0)
                 )
             except Exception as e:
-                app_logger.error(f"notify_deps_unblocked error: {e}")
+                app_logger.alert(f"notify_deps_unblocked error: {e}")
 
         # 4. Удаляем карточку, затем новым сообщением шлём подтверждение + список
         pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
@@ -1334,7 +1334,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=task_detail_kb(task_id, has_drawing=bool(task_full.get('drawing_link')))
                 )
         except Exception as e:
-            app_logger.error(f"Drawing download error: {e}")
+            app_logger.alert(f"Drawing download error: {e}")
             await context.bot.send_message(chat_id=user.id, text="Не удалось загрузить чертёж.")
 
     elif data.startswith("unblock:"):
@@ -1361,7 +1361,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     task['file_id'], task['sheet_name'], task['row_num'], 'ПЛАН', None, None
                 )
         except Exception as e:
-            app_logger.error(f"unblock sheets update error: {e}")
+            app_logger.alert(f"unblock sheets update error: {e}")
 
         # 3. Редактируем сообщение мастера — убираем кнопку, меняем статус
         new_text = (
@@ -1390,7 +1390,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=back_to_tasks_kb()
                 )
             except Exception as e:
-                app_logger.error(f"unblock notify worker error: {e}")
+                app_logger.alert(f"unblock notify worker error: {e}")
 
         app_logger.audit('unblock', user.id, user.username, {'task_id': task_id}, 'success')
 
@@ -1597,13 +1597,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _ps_restored:
                 _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_restored)
         except Exception as e:
-            app_logger.error(f"correct_cancel sheets update error: {e}")
+            app_logger.alert(f"correct_cancel sheets update error: {e}")
         # Лист: удаляем строку-остаток
         if remainder and remainder.get('row_num') and remainder['row_num'] > 0:
             try:
                 _sheets.delete_row(task['file_id'], task['sheet_name'], remainder['row_num'])
             except Exception as e:
-                app_logger.error(f"correct_cancel delete row error: {e}")
+                app_logger.alert(f"correct_cancel delete row error: {e}")
         app_logger.audit('master_correct_cancel', user.id, user.username,
                          {'task_id': task_id, 'restored_qty': restored_qty}, 'success')
         await query.edit_message_text(
@@ -1700,7 +1700,7 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
                 status='ВЫПОЛНЕНО', date_fact=today, qty_done=qty_done_total,
             )
         except Exception as e:
-            app_logger.error(f"Sheets full-done write error: {e}")
+            app_logger.alert(f"Sheets full-done write error: {e}")
         msg = f"✅ {task['position']} — {task['element'] or ''}\nВыполнено полностью | {today}"
 
     else:
@@ -1775,7 +1775,7 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
                 task['file_id'], task['sheet_name'], task['row_num'], remainder_data
             )
         except Exception as e:
-            app_logger.error(f"Sheets partial split error: {e}")
+            app_logger.alert(f"Sheets partial split error: {e}")
 
         msg = (f"◧ {task['position']} — {task['element'] or ''}\n"
                f"Выполнено: {qty_new} шт | Остаток {remaining} шт добавлен в план")
@@ -1790,7 +1790,7 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
             task['position'], qty_new
         )
     except Exception as e:
-        app_logger.error(f"notify_deps_unblocked (partial) error: {e}")
+        app_logger.alert(f"notify_deps_unblocked (partial) error: {e}")
 
     await update.message.reply_text(msg, reply_markup=back_to_tasks_kb())
     return ConversationHandler.END
@@ -1877,7 +1877,7 @@ async def receive_correction_qty(update: Update, context: ContextTypes.DEFAULT_T
                 if _rem_ps:
                     _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], rn, 'СУММА К ОПЛАТЕ', _rem_ps)
         except Exception as e:
-            app_logger.error(f"correct_qty sheets update error: {e}")
+            app_logger.alert(f"correct_qty sheets update error: {e}")
     else:
         # Остатка не было — создаём новый (как в partial flow)
         import uuid as _uuid
@@ -1914,7 +1914,7 @@ async def receive_correction_qty(update: Update, context: ContextTypes.DEFAULT_T
             }
             _sheets.insert_remainder_row(task['file_id'], task['sheet_name'], task['row_num'], remainder_data)
         except Exception as e:
-            app_logger.error(f"correct_qty sheets insert error: {e}")
+            app_logger.alert(f"correct_qty sheets insert error: {e}")
 
     app_logger.audit('master_correct_qty', user.id, user.username,
                      {'task_id': task_id, 'qty_new': qty_new, 'new_remaining': new_remaining}, 'success')
@@ -1959,7 +1959,7 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
             comment=comment
         )
     except Exception as e:
-        app_logger.error(f"Sheets write error: {e}")
+        app_logger.alert(f"Sheets write error: {e}")
 
     app_logger.audit('set_block', user.id, user.username,
                      {'task_id': task_id, 'comment': comment}, 'success')
@@ -2006,7 +2006,7 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         result = scan_folder_and_register(folder_id, created_by=user.id)
     except Exception as e:
-        app_logger.error(f"scan_folder error: {e}")
+        app_logger.alert(f"scan_folder error: {e}")
         await update.message.reply_text(
             f"❌ Ошибка при сканировании папки:\n{e}\n\nПроверьте доступ и попробуйте снова."
         )
@@ -2063,6 +2063,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(config.TG_TOKEN).build()
+    app_logger.set_bot(app.bot)
 
     partial_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(on_callback, pattern=r'^partial_ask:\d+$')],
@@ -2136,7 +2137,7 @@ def main():
         if 'Message is not modified' in str(err):
             return
 
-        app_logger.error(f"Unhandled exception: {err}\n{tb}")
+        app_logger.alert(f"Unhandled exception: {err}\n{tb}")
 
         # Сообщение пользователю
         user_text = (
