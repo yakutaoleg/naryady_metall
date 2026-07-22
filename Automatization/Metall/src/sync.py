@@ -218,6 +218,26 @@ def run():
                     sheets.write_row_ids(file_id, sheet_name, pending_row_ids)
                     logger.info(f'  {sheet_name}: записано {len(pending_row_ids)} новых ROW_ID')
 
+                # Удаляем призраки: placeholder-записи (row_num < 0) у которых
+                # уже есть реальная запись с тем же row_id и позитивным row_num
+                cleaned = db.fetchone("""
+                    WITH deleted AS (
+                        DELETE FROM work_orders ghost
+                        WHERE ghost.project_name = %s AND ghost.sheet_name = %s
+                          AND ghost.row_num < 0
+                          AND EXISTS (
+                              SELECT 1 FROM work_orders real
+                              WHERE real.row_id = ghost.row_id
+                                AND real.project_name = ghost.project_name
+                                AND real.sheet_name = ghost.sheet_name
+                                AND real.row_num > 0
+                          )
+                        RETURNING 1
+                    ) SELECT COUNT(*) AS cnt FROM deleted
+                """, (project_name, sheet_name))
+                if cleaned and cleaned['cnt']:
+                    logger.info(f'  {sheet_name}: удалено {cleaned["cnt"]} призраков')
+
                 logger.info(f'  {sheet_name}: {synced} rows')
                 logger.audit(action='sync_sheet',
                              details={'project': project_name, 'sheet': sheet_name, 'rows': synced})

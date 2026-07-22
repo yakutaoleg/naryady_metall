@@ -185,7 +185,7 @@ def get_active_tasks(worker_name: str, specialization: str = None):
         [worker_name]
     )
     for t in tasks:
-        if t['sheet_name'].upper() == 'СБОРКА':
+        if t['sheet_name'].upper() in SHEETS_WITH_DEPS:
             t['deps_ready'] = _deps_ready(t['project_name'], t['element'])
         else:
             t['deps_ready'] = True
@@ -902,7 +902,10 @@ def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 SHEET_ICONS = {
     'ПЛАЗМА': '🔥', 'ПИЛА': '🪚', 'СВЕРЛЕНИЕ': '🔩',
     'СБОРКА': '🔧', 'СВАРКА': '⚡', 'ПОКРАСКА': '🎨',
+    'ГРУНТОВКА': '🪣',
 }
+
+SHEETS_WITH_DEPS = {'СБОРКА', 'ПОКРАСКА', 'ГРУНТОВКА'}
 
 async def show_plans_today(update: Update, edit: bool = False):
     STATUS_ICON = {'ПЛАН': '☐', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '⛔', 'ЧАСТИЧНО': '◧'}
@@ -929,7 +932,7 @@ async def show_plans_today(update: Update, edit: bool = False):
             by_proj[r['project_name']][r['sheet_name']][r['executor']].append(r)
 
         lines = [f"📅 Планы на сегодня — {date.today().strftime('%d.%m')}"]
-        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА']
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА', 'ГРУНТОВКА']
         for proj_name in sorted(by_proj.keys()):
             lines.append("")
             lines.append(f"📁 {proj_name}")
@@ -1047,7 +1050,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out.append("")
         out.append("🔧 По цехам:")
 
-        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА']
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА', 'ГРУНТОВКА']
         stats_map = {r['sheet_name']: r for r in sheet_stats}
         for sheet in SHEET_ORDER:
             if sheet not in stats_map:
@@ -1180,9 +1183,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Задача не найдена.", reply_markup=back_to_tasks_kb())
             return
 
-        if task['sheet_name'].upper() == 'СБОРКА' and not _deps_ready(task['project_name'], task['element']):
+        if task['sheet_name'].upper() in SHEETS_WITH_DEPS and not _deps_ready(task['project_name'], task['element']):
             await query.answer(
-                f"☐ Ожидает готовности деталей.\nЗавершите позиции ПЛАЗМА/ПИЛА по этому элементу.",
+                f"☐ Ожидает готовности предыдущего этапа.",
                 show_alert=True
             )
             return
@@ -1773,6 +1776,12 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
             }
             _sheets.insert_remainder_row(
                 task['file_id'], task['sheet_name'], task['row_num'], remainder_data
+            )
+            # После успешной вставки в лист — заменяем placeholder row_num (-task_id)
+            # на реальную позицию, чтобы синк не создавал призраков
+            db.execute(
+                "UPDATE work_orders SET row_num=%s WHERE row_id=%s AND row_num=-%s",
+                [task['row_num'] + 1, new_row_id, task_id]
             )
         except Exception as e:
             app_logger.alert(f"Sheets partial split error: {e}")
