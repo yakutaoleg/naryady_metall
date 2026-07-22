@@ -901,11 +901,10 @@ def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 SHEET_ICONS = {
     'ПЛАЗМА': '🔥', 'ПИЛА': '🪚', 'СВЕРЛЕНИЕ': '🔩',
-    'СБОРКА': '🔧', 'СВАРКА': '⚡', 'ПОКРАСКА': '🎨',
-    'ГРУНТОВКА': '🪣',
+    'СБОРКА': '🔧', 'СВАРКА': '⚡',
 }
 
-SHEETS_WITH_DEPS = {'СБОРКА', 'ПОКРАСКА', 'ГРУНТОВКА'}
+SHEETS_WITH_DEPS = {'СБОРКА'}
 
 async def show_plans_today(update: Update, edit: bool = False):
     STATUS_ICON = {'ПЛАН': '☐', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '⛔', 'ЧАСТИЧНО': '◧'}
@@ -932,7 +931,7 @@ async def show_plans_today(update: Update, edit: bool = False):
             by_proj[r['project_name']][r['sheet_name']][r['executor']].append(r)
 
         lines = [f"📅 Планы на сегодня — {date.today().strftime('%d.%m')}"]
-        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА', 'ГРУНТОВКА']
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА']
         for proj_name in sorted(by_proj.keys()):
             lines.append("")
             lines.append(f"📁 {proj_name}")
@@ -1050,7 +1049,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out.append("")
         out.append("🔧 По цехам:")
 
-        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА', 'ГРУНТОВКА']
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА']
         stats_map = {r['sheet_name']: r for r in sheet_stats}
         for sheet in SHEET_ORDER:
             if sheet not in stats_map:
