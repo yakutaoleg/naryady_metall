@@ -12,7 +12,8 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from src import config, db, logger as app_logger
+from src import config, db
+from src import project_wizard as _wiz, logger as app_logger
 from src.sheets import update_task_status
 from google.oauth2.service_account import Credentials as _SACredentials
 from googleapiclient.discovery import build as _gdrive_build
@@ -46,6 +47,9 @@ WAITING_PROJECT_LINK   = 2
 WAITING_PARTIAL_QTY    = 3
 WAITING_EARNINGS_DATE  = 4
 WAITING_CORRECTION_QTY = 5
+WAITING_WIZARD_SPECS   = 6
+WAITING_WIZARD_CONFIRM = 7
+WAITING_WIZARD_SOURCES = 8
 TODAY = lambda: date.today().strftime('%d.%m.%Y')
 
 
@@ -180,7 +184,7 @@ def get_active_tasks(worker_name: str, specialization: str = None):
                   date_plan, priority, mandatory, status, drawing_link
            FROM work_orders
            WHERE executor=%s AND status IN ('ПЛАН','ЧАСТИЧНО')
-             AND (date_plan = CURRENT_DATE OR (mandatory = true AND date_plan < CURRENT_DATE))
+             AND (date_plan IS NULL OR date_plan <= CURRENT_DATE)
            ORDER BY mandatory DESC, sheet_name, priority ASC NULLS LAST, position""",
         [worker_name]
     )
@@ -204,28 +208,32 @@ def _deps_ready(project_name: str, element: str) -> bool:
     if not deps:
         return True
     for dep in deps:
-        row = db.fetchone(
+        # Проверяем по element (не position): все строки с этим элементом в upstream листе
+        rows = db.fetchall(
             """SELECT status FROM work_orders
-               WHERE project_name=%s AND sheet_name=%s AND position=%s
-               LIMIT 1""",
+               WHERE project_name=%s AND sheet_name=%s AND element=%s""",
             [project_name, dep['requires_sheet'], dep['requires_position']]
         )
-        if not row or row['status'] != 'ВЫПОЛНЕНО':
+        # Нет строк — upstream не заведён, считаем что не блокирует
+        if rows and any(r['status'] != 'ВЫПОЛНЕНО' for r in rows):
             return False
     return True
 
 
 async def _notify_worker_unblocked(bot, executor: str, position: str, element: str):
     emp = db.fetchone(
-        "SELECT telegram_username FROM employees WHERE full_name=%s AND is_active=true",
+        "SELECT telegram_username, telegram_id FROM employees WHERE full_name=%s AND is_active=true",
         [executor]
     )
-    if not emp or not emp['telegram_username']:
+    if not emp or (not emp['telegram_username'] and not emp['telegram_id']):
         return
     try:
-        chat = await bot.get_chat(f"@{emp['telegram_username']}")
+        if emp['telegram_id']:
+            _chat_id = emp['telegram_id']
+        else:
+            _chat_id = (await bot.get_chat(f"@{emp['telegram_username']}")).id
         await bot.send_message(
-            chat_id=chat.id,
+            chat_id=_chat_id,
             text=(
                 f"✅ Блокировка снята\n\n"
                 f"Позиция: {position} — {element or ''}\n"
@@ -262,16 +270,19 @@ async def _notify_masters_dep_unblocked(bot, project_name: str, waiting_sheet: s
 
 
 async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
-                                 completed_position: str, qty_done: int):
+                                 completed_position: str, qty_done: int,
+                                 completed_element: str = None):
     """Вызывается когда задача перешла в ЧАСТИЧНО или ВЫПОЛНЕНО.
     Ищет заблокированные задачи следующего уровня и разбивает их."""
     from src import sheets as _sheets
     import uuid as _uuid
 
+    # Сопоставляем по element (не position): completed_element — код сборочной единицы
+    match_key = completed_element or completed_position
     waiting_deps = db.fetchall(
         """SELECT DISTINCT waiting_sheet, element FROM element_dependencies
            WHERE project_name=%s AND requires_sheet=%s AND requires_position=%s""",
-        [project_name, completed_sheet, completed_position]
+        [project_name, completed_sheet, match_key]
     )
     if not waiting_deps:
         return
@@ -344,6 +355,8 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                         _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _tw_plan)
                     if _ps_plan:
                         _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_plan)
+                    from src.sheets import _NEXT_SPEC
+                    _next = _NEXT_SPEC.get(task['sheet_name'].upper(), '')
                     remainder_data = {
                         'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': task['position'] or '',
                         'ЭЛЕМЕНТ':               task['element'] or '',
@@ -352,6 +365,7 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                         'МАССА ВСЕХ (кг)':      _tw_block if _tw_block else '',
                         'СУММА К ОПЛАТЕ':       _ps_block if _ps_block else '',
                         'СТАТУС':               'БЛОК',
+                        'БЛОК':                 f'⛔ {_next}' if _next else '',
                         'ОБЯЗАТЕЛЬНАЯ':         'НЕТ',
                         'ИСПОЛНИТЕЛЬ':          task['executor'] or '',
                         'ROW_ID':               new_row_id,
@@ -390,24 +404,27 @@ async def notify_assembly_workers(bot, project_name: str, element: str):
     )
     for w in workers:
         emp = db.fetchone(
-            "SELECT id, telegram_username FROM employees WHERE full_name=%s AND is_active=true",
+            "SELECT id, telegram_username, telegram_id FROM employees WHERE full_name=%s AND is_active=true",
             [w['executor']]
         )
-        if not emp or not emp['telegram_username']:
+        if not emp or (not emp['telegram_username'] and not emp['telegram_id']):
             continue
         try:
-            chat = await bot.get_chat(f"@{emp['telegram_username']}")
+            if emp['telegram_id']:
+                _chat_id = emp['telegram_id']
+            else:
+                _chat_id = (await bot.get_chat(f"@{emp['telegram_username']}")).id
             text = (
                 f"✅ Детали готовы!\n\n"
                 f"Элемент: {element}\n"
                 f"Проект: {project_name}\n\n"
                 f"Можно брать в сборку."
             )
-            sent = await bot.send_message(chat_id=chat.id, text=text)
+            sent = await bot.send_message(chat_id=_chat_id, text=text)
             db.execute(
                 """INSERT INTO notifications (tg_user_id, notif_type, message_id)
                    VALUES (%s, 'ASSEMBLY_READY', %s)""",
-                [chat.id, sent.message_id]
+                [_chat_id, sent.message_id]
             )
         except Exception as e:
             app_logger.alert(f"notify_assembly error for {w['executor']}: {e}")
@@ -459,14 +476,18 @@ def mandatory_remaining(worker_name: str, specialization: str = None):
 async def notify_masters(bot, task_id: int, worker_name: str, specialization: str,
                          position: str, element: str, comment: str):
     masters = db.fetchall(
-        "SELECT id, telegram_username FROM employees WHERE role='master' AND is_active=true",
+        "SELECT id, telegram_username, telegram_id FROM employees WHERE role='master' AND is_active=true AND notify_blocks=true",
         []
     )
     for master in masters:
-        if not master['telegram_username']:
-            continue
         try:
-            chat = await bot.get_chat(f"@{master['telegram_username']}")
+            # Используем числовой telegram_id — надёжнее username
+            chat_id = master.get('telegram_id')
+            if not chat_id:
+                if not master['telegram_username']:
+                    continue
+                chat = await bot.get_chat(f"@{master['telegram_username']}")
+                chat_id = chat.id
             text = (
                 f"\U0001f6ab Блокировка на позиции\n\n"
                 f"Элемент: {element or '—'}\n"
@@ -479,11 +500,11 @@ async def notify_masters(bot, task_id: int, worker_name: str, specialization: st
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Снять блок", callback_data=f"unblock:{task_id}"),
             ]])
-            sent = await bot.send_message(chat_id=chat.id, text=text, reply_markup=kb)
+            sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
             db.execute(
                 """INSERT INTO notifications (tg_user_id, notif_type, work_order_id, message_id)
                    VALUES (%s, 'BLOCK_ALERT', %s, %s)""",
-                [chat.id, task_id, sent.message_id]
+                [chat_id, task_id, sent.message_id]
             )
         except Exception as e:
             app_logger.alert(f"notify_masters error for @{master['telegram_username']}: {e}")
@@ -500,7 +521,7 @@ def main_menu_kb(role: str = ''):
                 InlineKeyboardButton("🗂 Проекты", callback_data="projects"),
                 InlineKeyboardButton("🚫 Блоки", callback_data="master:blocks"),
             ],
-            [InlineKeyboardButton("📅 Планы на сегодня", callback_data="master:plans")],
+            [InlineKeyboardButton("📅 Планы на сегодня", callback_data=f"plans:{date.today().isoformat()}")],
             [InlineKeyboardButton("🔧 Исправить выполнение", callback_data="correct:workers")],
             [InlineKeyboardButton("📊 Выработка", callback_data=f"earnings:{date.today().isoformat()}")],
             [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
@@ -600,13 +621,27 @@ def back_to_tasks_kb():
     ]])
 
 
-def correct_workers_kb(workers: list):
-    rows = [[InlineKeyboardButton(f"👤 {w}", callback_data=f"correct:tasks:{w}")] for w in workers]
+def _correct_nav_row(date_str: str):
+    from datetime import timedelta
+    d        = date.fromisoformat(date_str)
+    prev_str = (d - timedelta(days=1)).isoformat()
+    next_str = (d + timedelta(days=1)).isoformat()
+    nav = [InlineKeyboardButton((d - timedelta(days=1)).strftime('← %d.%m'),
+                                callback_data=f"correct:workers:{prev_str}")]
+    if d < date.today() - timedelta(days=1):
+        nav.append(InlineKeyboardButton((d + timedelta(days=1)).strftime('%d.%m →'),
+                                        callback_data=f"correct:workers:{next_str}"))
+    return nav
+
+def correct_workers_kb(workers: list, date_str: str):
+    # workers = list of dicts: {executor, emp_id}
+    rows = [[InlineKeyboardButton(f"👤 {w['executor']}", callback_data=f"correct:tasks:{w['emp_id']}:{date_str}")] for w in workers]
+    rows.append(_correct_nav_row(date_str))
     rows.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
 
-def correct_tasks_kb(tasks: list):
+def correct_tasks_kb(tasks: list, date_str: str):
     rows = []
     current_group = None
     for t in tasks:
@@ -619,40 +654,49 @@ def correct_tasks_kb(tasks: list):
                 callback_data="noop"
             )])
         icon = '✅' if t['status'] == 'ВЫПОЛНЕНО' else '◧'
-        date_str = t['date_fact'].strftime('%d.%m') if t['date_fact'] else '—'
+        dfact = t['date_fact'].strftime('%d.%m') if t['date_fact'] else '—'
         qty = int(t['quantity'] or 0)
         rows.append([InlineKeyboardButton(
-            f"{icon} {t['position']} × {qty} шт ({date_str})",
+            f"{icon} {t['position']} × {qty} шт ({dfact})",
             callback_data=f"correct:action:{t['id']}"
         )])
-    rows.append([InlineKeyboardButton("← Рабочие", callback_data="correct:workers")])
+    rows.append(_correct_nav_row(date_str))
+    rows.append([InlineKeyboardButton("← Рабочие", callback_data=f"correct:workers:{date_str}")])
     return InlineKeyboardMarkup(rows)
 
 
-def correct_action_kb(task_id: int, executor: str, show_qty: bool = True):
+def correct_action_kb(task_id: int, emp_id: int, date_str: str, show_qty: bool = True):
     rows = []
     if show_qty:
         rows.append([InlineKeyboardButton("◧ Исправить количество", callback_data=f"correct:qty:{task_id}")])
     rows.append([InlineKeyboardButton("❌ Отменить полностью", callback_data=f"correct:cancel:{task_id}")])
-    rows.append([InlineKeyboardButton("← К задачам", callback_data=f"correct:tasks:{executor}")])
+    rows.append([InlineKeyboardButton("← К задачам", callback_data=f"correct:tasks:{emp_id}:{date_str}")])
     return InlineKeyboardMarkup(rows)
 
 
-def earnings_date_kb(date_str: str):
+def earnings_date_kb(date_str: str, page: int = 0, total_pages: int = 1):
     from datetime import timedelta
     d = date.fromisoformat(date_str)
     prev_str = (d - timedelta(days=1)).isoformat()
     next_str = (d + timedelta(days=1)).isoformat()
     prev_label = (d - timedelta(days=1)).strftime('← %d.%m')
     next_label = (d + timedelta(days=1)).strftime('%d.%m →')
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(prev_label, callback_data=f"earnings:{prev_str}"),
-            InlineKeyboardButton(next_label, callback_data=f"earnings:{next_str}"),
-        ],
-        [InlineKeyboardButton("📅 Выбрать дату", callback_data="earnings_pick")],
-        [InlineKeyboardButton("← Главное меню", callback_data="menu")],
+    rows = []
+    rows.append([
+        InlineKeyboardButton(prev_label, callback_data=f"earnings:{prev_str}"),
+        InlineKeyboardButton(next_label, callback_data=f"earnings:{next_str}"),
     ])
+    if total_pages > 1:
+        page_row = []
+        if page > 0:
+            page_row.append(InlineKeyboardButton(f"◀ стр {page}", callback_data=f"earnings:{date_str}:{page-1}"))
+        page_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            page_row.append(InlineKeyboardButton(f"стр {page+2} ▶", callback_data=f"earnings:{date_str}:{page+1}"))
+        rows.append(page_row)
+    rows.append([InlineKeyboardButton("📅 Выбрать дату", callback_data="earnings_pick")])
+    rows.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def back_to_menu_kb():
@@ -701,7 +745,7 @@ async def show_projects(update: Update, edit: bool = False):
         await msg.reply_text(text, reply_markup=kb)
 
 
-async def show_earnings(update: Update, date_str: str = None, edit: bool = False):
+async def show_earnings(update: Update, date_str: str = None, edit: bool = False, page: int = 0):
     from collections import defaultdict
     if date_str is None:
         date_str = date.today().isoformat()
@@ -745,16 +789,20 @@ async def show_earnings(update: Update, date_str: str = None, edit: bool = False
             result_lines.append('')
         result_lines.append('💰 <b>Итого за день: ' + f'{grand_total:.2f}' + ' руб</b>')
         text = '\n'.join(result_lines)
-    kb = earnings_date_kb(date_str)
+    lines = text.split("\n")
+    pages = _split_pages(lines, max_chars=3900) if len(text) > 3900 else [text]
+    total = len(pages)
+    page = max(0, min(page, total - 1))
+    kb = earnings_date_kb(date_str, page=page, total_pages=total)
     if edit and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode='HTML')
+        await update.callback_query.edit_message_text(pages[page], reply_markup=kb, parse_mode='HTML')
     else:
         msg = update.message or update.callback_query.message
-        await msg.reply_text(text, reply_markup=kb, parse_mode='HTML')
+        await msg.reply_text(pages[page], reply_markup=kb, parse_mode='HTML')
 
 
 async def show_tasks(update: Update, worker_name: str, specialization: str = None,
-                     bot=None, chat_id=None):
+                     bot=None, chat_id=None, banner: str = None):
     tasks   = get_active_tasks(worker_name)
     blocked = get_blocked_tasks(worker_name)
     mandatory_left = mandatory_remaining(worker_name)
@@ -771,7 +819,8 @@ async def show_tasks(update: Update, worker_name: str, specialization: str = Non
     optional_tasks  = [t for t in tasks if not t['mandatory']]
     multi_spec = len({t['sheet_name'] for t in tasks}) > 1
 
-    lines = [f"📋 Задачи на сегодня", f"📅 {TODAY()}\n"]
+    prefix = [banner, ""] if banner else []
+    lines = prefix + [f"📋 Задачи на сегодня", f"📅 {TODAY()}\n"]
 
     if mandatory_tasks:
         lines.append("❗ Обязательные:")
@@ -875,6 +924,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Сохраняем числовой chat_id — он надёжнее @username для уведомлений
+    db.execute(
+        "UPDATE employees SET telegram_id=%s WHERE full_name=%s",
+        [user.id, worker['full_name']]
+    )
     context.user_data['worker_name']    = worker['full_name']
     context.user_data['specialization'] = worker['specialization']
     context.user_data['role']           = worker.get('role', '')
@@ -902,36 +956,110 @@ def _get_worker_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 SHEET_ICONS = {
     'ПЛАЗМА': '🔥', 'ПИЛА': '🪚', 'СВЕРЛЕНИЕ': '🔩',
     'СБОРКА': '🔧', 'СВАРКА': '⚡',
+    'ГРУНТОВКА': '🖌', 'ПОКРАСКА': '🎨',
 }
 
-SHEETS_WITH_DEPS = {'СБОРКА'}
+SHEETS_WITH_DEPS = {'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА'}
 
-async def show_plans_today(update: Update, edit: bool = False):
+def plans_date_kb(date_str: str, page: int = 0, total_pages: int = 1):
+    from datetime import timedelta
+    d = date.fromisoformat(date_str)
+    prev_str = (d - timedelta(days=1)).isoformat()
+    next_str = (d + timedelta(days=1)).isoformat()
+    prev_label = (d - timedelta(days=1)).strftime('← %d.%m')
+    next_label = (d + timedelta(days=1)).strftime('%d.%m →')
+    rows = []
+    rows.append([
+        InlineKeyboardButton(prev_label, callback_data=f"plans:{prev_str}"),
+        InlineKeyboardButton(next_label, callback_data=f"plans:{next_str}"),
+    ])
+    if total_pages > 1:
+        page_row = []
+        if page > 0:
+            page_row.append(InlineKeyboardButton(f"◀ стр {page}", callback_data=f"plans:{date_str}:{page-1}"))
+        page_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            page_row.append(InlineKeyboardButton(f"стр {page+2} ▶", callback_data=f"plans:{date_str}:{page+1}"))
+        rows.append(page_row)
+    rows.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+def _split_pages(lines: list, max_chars: int = 3900) -> list:
+    """Разбивает список строк на страницы по max_chars символов."""
+    pages, current, length = [], [], 0
+    for line in lines:
+        chunk = line + "\n"
+        if length + len(chunk) > max_chars and current:
+            pages.append("\n".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(chunk)
+    if current:
+        pages.append("\n".join(current))
+    return pages or [""]
+
+async def show_plans(update: Update, date_str: str = None, edit: bool = False, page: int = 0):
+    from datetime import timedelta
+    if date_str is None:
+        date_str = date.today().isoformat()
+    d = date.fromisoformat(date_str)
+    today = date.today()
     STATUS_ICON = {'ПЛАН': '☐', 'ВЫПОЛНЕНО': '✅', 'БЛОК': '⛔', 'ЧАСТИЧНО': '◧'}
 
-    rows = db.fetchall(
-        """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
-                  (date_plan < CURRENT_DATE AND mandatory = true) AS overdue
-           FROM work_orders
-           WHERE executor IS NOT NULL AND executor != ''
-             AND (date_plan = CURRENT_DATE
-              OR (mandatory = true AND date_plan < CURRENT_DATE AND status = 'ПЛАН'))
-           ORDER BY project_name, sheet_name, executor,
-                    CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 WHEN 'ЧАСТИЧНО' THEN 2 ELSE 3 END,
-                    date_plan, position""",
-        []
-    )
+    if d == today:
+        rows = db.fetchall(
+            """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
+                      payment_sum,
+                      (date_plan < CURRENT_DATE AND mandatory = true) AS overdue
+               FROM work_orders
+               WHERE executor IS NOT NULL AND executor != ''
+                 AND (date_plan = CURRENT_DATE
+                  OR (mandatory = true AND date_plan < CURRENT_DATE AND status = 'ПЛАН'))
+               ORDER BY project_name, sheet_name, executor,
+                        CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 WHEN 'ЧАСТИЧНО' THEN 2 ELSE 3 END,
+                        date_plan, position""",
+            []
+        )
+    else:
+        rows = db.fetchall(
+            """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
+                      payment_sum,
+                      false AS overdue
+               FROM work_orders
+               WHERE executor IS NOT NULL AND executor != ''
+                 AND date_plan = %s
+               ORDER BY project_name, sheet_name, executor,
+                        CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 WHEN 'ЧАСТИЧНО' THEN 2 ELSE 3 END,
+                        position""",
+            [d]
+        )
+
+    delta = (d - today).days
+    if delta == 0:
+        day_label = "сегодня"
+    elif delta == 1:
+        day_label = "завтра"
+    elif delta == 2:
+        day_label = "послезавтра"
+    elif delta == -1:
+        day_label = "вчера"
+    elif delta > 2:
+        day_label = f"+{delta} дн."
+    else:
+        day_label = f"{delta} дн."
+    date_label = f"{d.strftime('%d.%m')} ({day_label})"
+
     if not rows:
-        text = chr(10).join(["📅 Планы на сегодня", "", "Нет задач на сегодня."])
+        text = chr(10).join([f"📅 Планы — {date_label}", "", "Нет задач на эту дату."])
     else:
         from collections import defaultdict
-        # project -> sheet -> executor -> [tasks]
         by_proj = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         for r in rows:
             by_proj[r['project_name']][r['sheet_name']][r['executor']].append(r)
 
-        lines = [f"📅 Планы на сегодня — {date.today().strftime('%d.%m')}"]
-        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА']
+        lines = [f"📅 Планы — {date_label}"]
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']
+        grand_total = 0.0
         for proj_name in sorted(by_proj.keys()):
             lines.append("")
             lines.append(f"📁 {proj_name}")
@@ -942,24 +1070,46 @@ async def show_plans_today(update: Update, edit: bool = False):
                 lines.append(f"  {icon} {sheet}")
                 for executor, tasks in by_proj[proj_name][sheet].items():
                     lines.append(f"    👷 {executor}")
+                    exec_total = 0.0
                     for t in tasks:
                         qty = f" × {int(t['quantity'])}" if t['quantity'] else ""
                         elem = f" ({t['element']})" if t['element'] else ""
                         sicon = STATUS_ICON.get(t['status'], '☐')
                         overdue_mark = f" (от {t['date_plan'].strftime('%d.%m')})" if t.get('overdue') else ""
                         lines.append(f"      {sicon} {t['position']}{elem}{qty}{overdue_mark}")
+                        if t['status'] != 'БЛОК':
+                            exec_total += float(t['payment_sum'] or 0)
+                    if exec_total > 0:
+                        lines.append(f"      💵 {exec_total:.2f} руб")
+                    grand_total += exec_total
+        if grand_total > 0:
+            lines.append("")
+            lines.append(f"💰 Итого за день: {grand_total:.2f} руб")
         text = chr(10).join(lines)
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Главное меню", callback_data="menu")]])
+    pages = _split_pages(text.split("\n")) if len(text) > 3900 else [text]
+    total = len(pages)
+    page = max(0, min(page, total - 1))
+    kb = plans_date_kb(date_str, page=page, total_pages=total)
     if edit:
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
+        await update.callback_query.edit_message_text(pages[page], reply_markup=kb)
     else:
-        await update.effective_message.reply_text(text, reply_markup=kb)
+        await update.effective_message.reply_text(pages[page], reply_markup=kb)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        # callback query expired (>48h) — notify user and stop
+        try:
+            await query.message.reply_text(
+                "⚠️ Кнопка устарела — откройте меню заново командой /start"
+            )
+        except Exception:
+            pass
+        return
     user = update.effective_user
     data = query.data
 
@@ -973,11 +1123,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu":
         await show_menu(update, worker_name, specialization, role, edit=True)
 
-    elif data == "master:plans":
+    elif data.startswith("plans:"):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
-        await show_plans_today(update, edit=True)
+        parts = data.split(":")
+        # plans:{date_str} или plans:{date_str}:{page}
+        date_str = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        await show_plans(update, date_str, edit=True, page=page)
+
+    elif data == "noop":
+        await query.answer()
+        return
 
     elif data == "projects":
         if not is_master(role):
@@ -990,11 +1148,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
         await query.edit_message_text(
-            "📁 Добавление проекта\n\n"
-            "Отправьте ссылку на папку проекта в Google Drive.\n"
-            "Папка должна содержать:\n"
-            "• таблицу Google Sheets (наряды)\n"
-            "• подпапку с чертежами (опционально)\n\n"
+            "📁 Новый проект\n\n"
+            "Отправьте ссылку на папку проекта в Google Drive.\n\n"
+            "Бот сам найдёт Excel-файлы с деталями, распознает специализации и создаст таблицу нарядов.\n\n"
             "Формат: https://drive.google.com/drive/folders/...",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Отмена", callback_data="projects")
@@ -1049,7 +1205,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out.append("")
         out.append("🔧 По цехам:")
 
-        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА']
+        SHEET_ORDER = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']
         stats_map = {r['sheet_name']: r for r in sheet_stats}
         for sheet in SHEET_ORDER:
             if sheet not in stats_map:
@@ -1083,23 +1239,65 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Проект не найден.", show_alert=True)
             return
         await query.answer("🔄 Запускаю синхронизацию...")
+
+        # Живое отображение прогресса
+        proj_name = project['project_name']
+        sheet_lines: list[str] = []
+        msg_text   = [f"🔄 Синхронизация: {proj_name}\n"]
+        loop = asyncio.get_event_loop()
+
+        def _build_text():
+            return "\n".join(msg_text + sheet_lines[-12:])
+
+        def _safe_edit(text):
+            async def _do():
+                try:
+                    await query.edit_message_text(text)
+                except Exception:
+                    pass
+            asyncio.run_coroutine_threadsafe(_do(), loop)
+
+        def progress_cb(phase, data):
+            if phase == 'project_start':
+                if data['project'] != proj_name:
+                    msg_text.append(f"\n📁 {data['project']}")
+                    sheet_lines.clear()
+            elif phase == 'sheet_done':
+                rows   = data['rows']
+                splits = data.get('splits', 0)
+                icon   = '✅' if rows > 0 else '➖'
+                line   = f"{icon} {data['sheet']}: {rows} стр."
+                if splits:
+                    line += f" (+{splits} сплит)"
+                sheet_lines.append(line)
+                done  = data['sheets_done']
+                total = data['total_sheets']
+                filled = int(done / total * 10)
+                bar = '▓' * filled + '░' * (10 - filled)
+                progress_line = f"[{bar}] {done}/{total}"
+                _safe_edit(_build_text() + f"\n⏳ {progress_line}")
+            elif phase == 'deps_done':
+                sheet_lines.append("\n🔗 Зависимости обновлены")
+                _safe_edit(_build_text())
+            elif phase == 'sync_done':
+                total = data['total']
+                final = _build_text() + f"\n\n✅ Готово! Обработано строк: {total}"
+                async def _finalize():
+                    try:
+                        await query.edit_message_text(
+                            final,
+                            reply_markup=project_detail_kb(project_id, 'АКТИВНЫЙ')
+                        )
+                    except Exception:
+                        pass
+                asyncio.run_coroutine_threadsafe(_finalize(), loop)
+
         try:
-            import subprocess, sys
-            subprocess.Popen(
-                [sys.executable, '-m', 'src.sync'],
-                cwd='/root/naryady/test',
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            await query.edit_message_text(
-                f"🔄 Синхронизация запущена\n\n"
-                f"📁 {project['project_name']}\n\n"
-                f"Данные обновятся в течение минуты.",
-                reply_markup=project_detail_kb(project_id, 'АКТИВНЫЙ')
-            )
+            from src import sync as _sync
+            await loop.run_in_executor(None, _sync.run, progress_cb)
         except Exception as e:
             app_logger.alert(f"sync trigger error: {e}")
-            await query.answer("Ошибка запуска синхронизации.", show_alert=True)
+            await query.answer("Ошибка синхронизации.", show_alert=True)
 
     elif data.startswith("project:archive:"):
         if not is_master(role):
@@ -1107,6 +1305,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         project_id = int(data.split(":")[2])
         project = db.fetchone("SELECT project_name FROM projects WHERE id=%s", [project_id])
+        if not project:
+            await query.answer("Проект не найден.", show_alert=True)
+            return
         db.execute("UPDATE projects SET status='АРХИВ' WHERE id=%s", [project_id])
         await query.answer(f"Проект «{project['project_name']}» перемещён в архив.")
         await show_projects(update, edit=True)
@@ -1117,6 +1318,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         project_id = int(data.split(":")[2])
         project = db.fetchone("SELECT project_name FROM projects WHERE id=%s", [project_id])
+        if not project:
+            await query.answer("Проект не найден.", show_alert=True)
+            return
         db.execute("UPDATE projects SET status='АКТИВНЫЙ' WHERE id=%s", [project_id])
         await query.answer(f"Проект «{project['project_name']}» восстановлен.")
         await show_projects(update, edit=True)
@@ -1154,8 +1358,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
-        date_str = data.split(":", 1)[1]
-        await show_earnings(update, date_str, edit=True)
+        parts = data.split(":")
+        # earnings:{date_str} или earnings:{date_str}:{page}
+        date_str = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        await show_earnings(update, date_str, edit=True, page=page)
 
     elif data == "earnings_pick":
         if not is_master(role):
@@ -1192,10 +1399,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not task['mandatory']:
             mandatory_left = mandatory_remaining(worker_name, specialization)
             if mandatory_left:
-                positions = ", ".join(mandatory_left)
-                await query.answer(
-                    f"Сначала выполните обязательные:\n{positions}",
-                    show_alert=True
+                lines = ["\u26a0\ufe0f Сначала выполните обязательные задачи:"]
+                for p in mandatory_left:
+                    lines.append(f"  • {p}")
+                await query.answer()
+                await query.edit_message_text(
+                    "\n".join(lines),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("← К задачам", callback_data="tasks")]
+                    ])
                 )
                 return
 
@@ -1216,7 +1428,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 1. Обновляем PostgreSQL
         db.execute(
-            "UPDATE work_orders SET status='ВЫПОЛНЕНО', date_fact=CURRENT_DATE WHERE id=%s AND status='ПЛАН'",
+            "UPDATE work_orders SET status='ВЫПОЛНЕНО', date_fact=CURRENT_DATE WHERE id=%s AND status IN ('ПЛАН','ЧАСТИЧНО')",
             [task_id]
         )
 
@@ -1243,23 +1455,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     app_logger.alert(f"notify_assembly_workers error: {e}")
 
         # 4. Разблокируем зависимые задачи следующего уровня
-        if task.get('position') and task.get('project_name'):
+        if task.get('project_name'):
             try:
                 await notify_deps_unblocked(
                     context.bot, task['project_name'], task['sheet_name'],
-                    task['position'], int(task['quantity'] or 0)
+                    task['position'], int(task['quantity'] or 0),
+                    completed_element=task.get('element'),
                 )
             except Exception as e:
                 app_logger.alert(f"notify_deps_unblocked error: {e}")
 
-        # 4. Удаляем карточку, затем новым сообщением шлём подтверждение + список
-        pay = f"\n💵 К оплате: {task['payment_sum']} руб" if task['payment_sum'] else ""
-        await query.delete_message()
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=f"✅ {task['position']} — {task['element'] or ''}\nВыполнено | {TODAY()}{pay}"
-        )
-        await show_tasks(update, worker_name, specialization, bot=context.bot, chat_id=user.id)
+        # 4. Редактируем карточку — показываем список с баннером "выполнено"
+        pay = f" | 💵 {task['payment_sum']} руб" if task['payment_sum'] else ""
+        banner = f"✅ {task['position']} — {task['element'] or ''} | Выполнено{pay}"
+        await show_tasks(update, worker_name, specialization, banner=banner)
 
     elif data.startswith("partial_ask:"):
         task_id = int(data.split(":")[1])
@@ -1376,14 +1585,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3. Уведомляем рабочего
         worker = db.fetchone(
-            "SELECT telegram_username FROM employees WHERE full_name=%s AND is_active=true",
+            "SELECT telegram_username, telegram_id FROM employees WHERE full_name=%s AND is_active=true",
             [task['executor']]
         )
-        if worker and worker['telegram_username']:
+        if worker and (worker['telegram_username'] or worker['telegram_id']):
             try:
-                worker_chat = await context.bot.get_chat(f"@{worker['telegram_username']}")
+                if worker['telegram_id']:
+                    _worker_chat_id = worker['telegram_id']
+                else:
+                    _worker_chat_id = (await context.bot.get_chat(f"@{worker['telegram_username']}")).id
                 await context.bot.send_message(
-                    chat_id=worker_chat.id,
+                    chat_id=_worker_chat_id,
                     text=(
                         f"✅ Блокировка снята\n\n"
                         f"Позиция: {task['position']} — {task['element'] or ''}\n"
@@ -1421,53 +1633,79 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await show_menu(update, worker_name, specialization, role, edit=False)
 
-    elif data == "correct:workers":
+    elif data.startswith("correct:workers"):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
+        import datetime as _dt
+        parts = data.split(":")
+        date_str = parts[2] if len(parts) > 2 else (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
         workers = db.fetchall(
-            """SELECT DISTINCT executor FROM work_orders
-               WHERE status IN ('ВЫПОЛНЕНО', 'ЧАСТИЧНО')
-                 AND date_fact >= CURRENT_DATE - INTERVAL '1 day'
-                 AND executor IS NOT NULL AND executor != ''
-               ORDER BY executor""",
-            []
+            """SELECT DISTINCT wo.executor, COALESCE(e.id, 0) AS emp_id
+               FROM work_orders wo
+               LEFT JOIN employees e ON e.full_name = wo.executor
+               WHERE wo.status IN ('ВЫПОЛНЕНО', 'ЧАСТИЧНО')
+                 AND wo.date_fact = %s
+                 AND wo.executor IS NOT NULL AND wo.executor != ''
+               ORDER BY wo.executor""",
+            [date_str]
         )
+        d_label = date.fromisoformat(date_str).strftime('%d.%m.%Y')
         if not workers:
             await query.edit_message_text(
-                "Нет выполненных задач за сегодня и вчера.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="menu")]])
+                f"🔧 Исправить выполнение — {d_label}\n\nНет выполненных задач за этот день.",
+                reply_markup=InlineKeyboardMarkup([
+                    _correct_nav_row(date_str),
+                    [InlineKeyboardButton("← Меню", callback_data="menu")]
+                ])
             )
             return
         await query.edit_message_text(
-            "🔧 Исправить выполнение\n\nВыберите рабочего:",
-            reply_markup=correct_workers_kb([w['executor'] for w in workers])
+            f"🔧 Исправить выполнение — {d_label}\n\nВыберите рабочего:",
+            reply_markup=correct_workers_kb(workers, date_str)
         )
 
     elif data.startswith("correct:tasks:"):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
-        w_name = data[len("correct:tasks:"):]
+        import datetime as _dt
+        # correct:tasks:{emp_id}:{date}
+        rest  = data[len("correct:tasks:"):]
+        parts = rest.rsplit(":", 1)
+        emp_id   = int(parts[0]) if parts[0].isdigit() else 0
+        date_str = parts[1] if len(parts) > 1 else (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
+        # Имя по emp_id
+        if emp_id:
+            emp_row = db.fetchone("SELECT full_name FROM employees WHERE id=%s", [emp_id])
+            w_name  = emp_row['full_name'] if emp_row else str(emp_id)
+        else:
+            w_name = str(emp_id)
         tasks = db.fetchall(
-            """SELECT id, position, element, quantity, qty_done, status, date_fact,
-                      sheet_name, project_name, file_id, row_num
-               FROM work_orders
-               WHERE executor=%s
-                 AND status IN ('ВЫПОЛНЕНО', 'ЧАСТИЧНО')
-                 AND date_fact >= CURRENT_DATE - INTERVAL '1 day'
-               ORDER BY project_name, sheet_name, date_fact DESC, position""",
-            [w_name]
+            """SELECT wo.id, wo.position, wo.element, wo.quantity, wo.qty_done, wo.status, wo.date_fact,
+                      wo.sheet_name, wo.project_name, wo.file_id, wo.row_num,
+                      COALESCE(e.id, 0) AS emp_id
+               FROM work_orders wo
+               LEFT JOIN employees e ON e.full_name = wo.executor
+               WHERE wo.executor=%s
+                 AND wo.status IN ('ВЫПОЛНЕНО', 'ЧАСТИЧНО')
+                 AND wo.date_fact = %s
+               ORDER BY wo.project_name, wo.sheet_name, wo.position""",
+            [w_name, date_str]
         )
+        d_label = date.fromisoformat(date_str).strftime('%d.%m.%Y')
         if not tasks:
             await query.edit_message_text(
-                f"Нет задач у {w_name} за последние 2 дня.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Рабочие", callback_data="correct:workers")]])
+                f"🔧 Исправить выполнение — {d_label}\n👤 {w_name}\n\nНет задач за этот день.",
+                reply_markup=InlineKeyboardMarkup([
+                    _correct_nav_row(date_str),
+                    [InlineKeyboardButton("← Рабочие", callback_data=f"correct:workers:{date_str}")]
+                ])
             )
             return
         await query.edit_message_text(
-            f"🔧 Исправить выполнение\n👤 {w_name}\n\nВыберите задачу:",
-            reply_markup=correct_tasks_kb(tasks)
+            f"🔧 Исправить выполнение — {d_label}\n👤 {w_name}\n\nВыберите задачу:",
+            reply_markup=correct_tasks_kb(tasks, date_str)
         )
 
     elif data.startswith("correct:action:"):
@@ -1514,7 +1752,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         # qty=1 → только отмена (нельзя исправить до 0)
         show_qty = qty > 1
-        await query.edit_message_text(text, reply_markup=correct_action_kb(task_id, task['executor'], show_qty))
+        _ds_ca  = task['date_fact'].isoformat() if task.get('date_fact') else (date.today() - __import__('datetime').timedelta(days=1)).isoformat()
+        _emp_ca = task.get('emp_id') or 0
+        if not _emp_ca:
+            _e = db.fetchone("SELECT id FROM employees WHERE full_name=%s", [task['executor']])
+            _emp_ca = _e['id'] if _e else 0
+        await query.edit_message_text(text, reply_markup=correct_action_kb(task_id, _emp_ca, _ds_ca, show_qty))
 
     elif data.startswith("correct:qty:"):
         if not is_master(role):
@@ -1613,7 +1856,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Позиция: {task['position']} — {task['element'] or ''}\n"
             f"Возвращено в ПЛАН: {restored_qty} шт",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("← К рабочему", callback_data=f"correct:tasks:{task['executor']}")
+                InlineKeyboardButton("← К рабочему", callback_data=f"correct:tasks:{task.get('emp_id') or 0}:{task['date_fact'].isoformat() if task.get('date_fact') else ''}")
             ]])
         )
 
@@ -1726,10 +1969,10 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
             "INSERT INTO work_orders "
             "(project_name, file_id, sheet_name, row_num, row_id, "
             " position, element, quantity, unit_weight, total_weight, payment_sum, "
-            " executor, date_plan, priority, mandatory, status, drawing_link) "
+            " executor, date_plan, priority, mandatory, status, drawing_link, qty_holes) "
             "SELECT project_name, file_id, sheet_name, -%s, %s, "
             "       position, element, %s, unit_weight, %s, %s, "
-            "       NULL, date_plan, priority, true, 'ПЛАН', drawing_link "
+            "       NULL, date_plan, priority, true, 'ПЛАН', drawing_link, qty_holes "
             "FROM work_orders WHERE id=%s",
             [task_id, new_row_id, remaining, _tw_remain, _ps_remain, task_id]
         )
@@ -1772,16 +2015,13 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
                 'ИСПОЛНИТЕЛЬ':           '',
                 'ROW_ID':                new_row_id,
                 'ССЫЛКА НА ЧЕРТЁЖ':     task['drawing_link'] or '',
+                'КОЛ-ВО ОТВЕРСТИЙ':     task['qty_holes'] if task.get('qty_holes') else '',
             }
             _sheets.insert_remainder_row(
                 task['file_id'], task['sheet_name'], task['row_num'], remainder_data
             )
-            # После успешной вставки в лист — заменяем placeholder row_num (-task_id)
-            # на реальную позицию, чтобы синк не создавал призраков
-            db.execute(
-                "UPDATE work_orders SET row_num=%s WHERE row_id=%s AND row_num=-%s",
-                [task['row_num'] + 1, new_row_id, task_id]
-            )
+            # placeholder (row_num=-task_id) синк почистит сам при следующем запуске:
+            # найдёт реальную строку с тем же row_id и удалит ghost-запись
         except Exception as e:
             app_logger.alert(f"Sheets partial split error: {e}")
 
@@ -1795,7 +2035,8 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await notify_deps_unblocked(
             context.bot, task['project_name'], task['sheet_name'],
-            task['position'], qty_new
+            task['position'], qty_new,
+            completed_element=task.get('element'),
         )
     except Exception as e:
         app_logger.alert(f"notify_deps_unblocked (partial) error: {e}")
@@ -1995,10 +2236,10 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: получаем ссылку на папку Drive, сканируем, показываем найденные специализации."""
     user = update.effective_user
     text = update.message.text.strip()
 
-    # Извлекаем folder_id из ссылки
     m = re.search(r'/folders/([a-zA-Z0-9_-]+)', text)
     if not m:
         await update.message.reply_text(
@@ -2009,33 +2250,405 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
         return WAITING_PROJECT_LINK
 
     folder_id = m.group(1)
-    await update.message.reply_text("🔍 Сканирую папку...")
+    msg = await update.message.reply_text("🔍 Сканирую папку Drive...")
 
     try:
-        result = scan_folder_and_register(folder_id, created_by=user.id)
+        scan = _wiz.scan_and_recognize(folder_id)
     except Exception as e:
-        app_logger.alert(f"scan_folder error: {e}")
-        await update.message.reply_text(
-            f"❌ Ошибка при сканировании папки:\n{e}\n\nПроверьте доступ и попробуйте снова."
+        app_logger.alert(f"wizard scan error: {e}")
+        await msg.edit_text(f"❌ Ошибка сканирования:\n{e}\n\nПроверьте доступ или /cancel.")
+        return WAITING_PROJECT_LINK
+
+    if not scan['ok']:
+        await msg.edit_text(f"❌ {scan['error']}\n\nПопробуйте другую папку или /cancel.")
+        return WAITING_PROJECT_LINK
+
+    if not scan['recognized']:
+        await msg.edit_text(
+            "❌ В папке не найдено Excel-файлов с распознанными специализациями.\n\n"
+            "Папка должна содержать файлы деталей (пластины, профиль, сборочные марки).\n"
+            "Попробуйте другую папку или /cancel."
         )
         return WAITING_PROJECT_LINK
 
-    if not result['ok']:
-        await update.message.reply_text(
-            f"❌ {result['error']}\n\nПопробуйте другую папку или /cancel для отмены."
-        )
-        return WAITING_PROJECT_LINK
+    # Собираем все уникальные специализации
+    all_specs: list[str] = []
+    for rec in scan['recognized']:
+        for s in rec['specs']:
+            if s not in all_specs:
+                all_specs.append(s)
 
-    _, _, role = _get_worker_context(update, context)
-    await update.message.reply_text(
-        f"✅ Проект добавлен!\n\n"
-        f"📁 {result['project_name']}\n\n"
+    all_specs_ordered = _wiz.get_all_specs()  # все 8 в правильном порядке
+
+    # Распознанные спец — всегда в порядке ALL_SPECS, не в порядке файлов
+    _found = {s for rec in scan['recognized'] for s in rec['specs']}
+    recognized_specs = [s for s in all_specs_ordered if s in _found]
+
+    context.user_data['wiz_folder_id']   = folder_id
+    context.user_data['wiz_folder_name'] = scan['folder_name']
+    context.user_data['wiz_recognized']  = scan['recognized']
+    context.user_data['wiz_drawings_id'] = scan.get('drawings_folder_id')
+    context.user_data['wiz_all_specs']   = all_specs_ordered
+    context.user_data['wiz_active_specs'] = recognized_specs[:]  # по умолчанию — только найденные
+
+    await msg.delete()
+    await _wizard_show_specs(update, context)
+    return WAITING_WIZARD_SPECS
+
+
+def _wizard_specs_keyboard(active_specs: list[str], all_specs: list[str]) -> InlineKeyboardMarkup:
+    """Клавиатура для выбора специализаций (галочки вкл/выкл)."""
+    rows = []
+    for spec in all_specs:
+        checked = "✅" if spec in active_specs else "☐"
+        rows.append([InlineKeyboardButton(
+            f"{checked} {spec}",
+            callback_data=f"wiz_toggle:{spec}"
+        )])
+    rows.append([
+        InlineKeyboardButton("Отмена", callback_data="projects"),
+        InlineKeyboardButton("Далее →", callback_data="wiz_next"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _wizard_show_specs(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_msg=None):
+    """Показывает экран выбора специализаций — все 8, распознанные отмечены."""
+    folder_name  = context.user_data.get('wiz_folder_name', '—')
+    active_specs = context.user_data.get('wiz_active_specs', [])
+    all_specs    = context.user_data.get('wiz_all_specs', _wiz.get_all_specs())
+    recognized   = context.user_data.get('wiz_recognized', [])
+
+    # Какие файлы найдены
+    files_txt = ""
+    for rec in recognized:
+        files_txt += f"  • {rec['file']['name']} → {', '.join(rec['specs'])}\n"
+    if not files_txt:
+        files_txt = "  (файлы не найдены)\n"
+
+    text = (
+        f"📁 *{folder_name}*\n\n"
+        f"Найдено в папке:\n{files_txt}\n"
+        f"Выберите специализации для проекта:"
+    )
+    kb = _wizard_specs_keyboard(active_specs, all_specs)
+
+    if edit_msg:
+        await edit_msg.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def wizard_toggle_spec(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик переключения галочки специализации."""
+    query = update.callback_query
+    await query.answer()
+    spec = query.data.split(":", 1)[1]
+
+    active = context.user_data.get('wiz_active_specs', [])
+    if spec in active:
+        active.remove(spec)
+    else:
+        active.append(spec)
+    context.user_data['wiz_active_specs'] = active
+
+    await _wizard_show_specs(update, context, edit_msg=query.message)
+    return WAITING_WIZARD_SPECS
+
+
+async def wizard_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: строит source_map и показывает экран источников данных."""
+    query = update.callback_query
+    await query.answer()
+
+    active_specs = context.user_data.get('wiz_active_specs', [])
+    if not active_specs:
+        await query.answer("Выберите хотя бы одну специализацию!", show_alert=True)
+        return WAITING_WIZARD_SPECS
+
+    recognized  = context.user_data.get('wiz_recognized', [])
+    folder_name = context.user_data.get('wiz_folder_name', '—')
+
+    # Строим маппинг spec → файл
+    source_map = _wiz.build_source_map(active_specs, recognized)
+    context.user_data['wiz_source_map'] = source_map
+
+    await _wizard_show_sources(query.message, folder_name, source_map)
+    return WAITING_WIZARD_SOURCES
+
+
+async def _wizard_show_sources(msg, folder_name: str, source_map: list[dict]) -> None:
+    """Отрисовывает экран источников данных с возможностью отжать файл."""
+    text_lines = [f"📋 *{folder_name} — наряды*\n", "Данные для каждой вкладки:"]
+    kb_rows = []
+
+    for si, item in enumerate(source_map):
+        spec    = item['spec']
+        entries = item.get('entries', [])
+        if not entries:
+            text_lines.append(f"  ⬜ {spec}  —  пустая вкладка")
+        else:
+            for ei, entry in enumerate(entries):
+                active = entry.get('active', True)
+                stype  = entry['source_type']
+                fname  = entry['file']['name']
+                icon   = "✅" if active else "☐"
+                suffix = " (из группы СБОРКА)" if stype == 'fallback' else ""
+                text_lines.append(f"  {icon} {spec}  ←  {fname}{suffix}")
+                kb_rows.append([InlineKeyboardButton(
+                    f"{'✅' if active else '☐'} {spec}: {fname}",
+                    callback_data=f"wiz_src_toggle:{si}:{ei}",
+                )])
+
+    text_lines.append(f"\nНазвание файла: *{folder_name} - наряды*")
+    text = "\n".join(text_lines)
+
+    kb_rows.append([
+        InlineKeyboardButton("← Назад", callback_data="wiz_sources_back"),
+        InlineKeyboardButton("✅ Создать", callback_data="wiz_create"),
+    ])
+    kb = InlineKeyboardMarkup(kb_rows)
+    await msg.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def wizard_toggle_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключает активность конкретного файла-источника."""
+    query = update.callback_query
+    await query.answer()
+    _, si_str, ei_str = query.data.split(':')
+    si, ei = int(si_str), int(ei_str)
+
+    source_map = context.user_data.get('wiz_source_map', [])
+    try:
+        entry = source_map[si]['entries'][ei]
+        entry['active'] = not entry.get('active', True)
+    except (IndexError, KeyError):
+        return WAITING_WIZARD_SOURCES
+
+    context.user_data['wiz_source_map'] = source_map
+    folder_name = context.user_data.get('wiz_folder_name', '—')
+    await _wizard_show_sources(query.message, folder_name, source_map)
+    return WAITING_WIZARD_SOURCES
+
+async def wizard_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вернуться к выбору специализаций (из экрана источников)."""
+    query = update.callback_query
+    await query.answer()
+    await _wizard_show_specs(update, context, edit_msg=query.message)
+    return WAITING_WIZARD_SPECS
+
+
+# Алиас для кнопки на экране источников
+
+async def wizard_cut_drawings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нарезает PDF чертежей на отдельные страницы и привязывает к позициям."""
+    query = update.callback_query
+    await query.answer()
+
+    info = context.user_data.pop('wiz_cut', None)
+    if not info:
+        await query.message.edit_text('❌ Данные сессии устарели. Начните создание проекта заново.')
+        return
+
+    sheet_id     = info['sheet_id']
+    drawings_id  = info['drawings_id']
+    active_specs = info['active_specs']
+
+    await query.message.edit_text('⏳ Нарезаю PDF на отдельные страницы...')
+    try:
+        pos_map = _wiz.cut_pdf_drawings(drawings_id)
+    except Exception as e:
+        app_logger.alert(f'cut_pdf_drawings error: {e}')
+        await query.message.edit_text(f'❌ Ошибка при нарезке чертежей:\n{e}')
+        return
+
+    recognized = len(pos_map)
+    await query.message.edit_text(
+        f'✂️ Нарезка завершена: {recognized} позиций распознано.\n'
+        f'⏳ Привязываю к строкам таблицы...'
+    )
+    try:
+        linked = _wiz.link_drawings(sheet_id, drawings_id, active_specs)
+    except Exception as e:
+        app_logger.alert(f'link_drawings after cut error: {e}')
+        await query.message.edit_text(
+            f'✂️ Нарезано: {recognized} позиций.\n'
+            f'⚠️ Ошибка при привязке к таблице: {e}'
+        )
+        return
+
+    await query.message.edit_text(
+        f'✅ Готово!\n'
+        f'✂️ Нарезано страниц: {recognized}\n'
+        f'🔗 Привязано к строкам: {linked}'
+    )
+
+
+wizard_sources_back = wizard_back
+
+
+async def wizard_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Финальный шаг: создаём Google Sheet, вкладки, грузим данные, регистрируем в БД."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    folder_id    = context.user_data['wiz_folder_id']
+    folder_name  = context.user_data['wiz_folder_name']
+    active_specs = context.user_data['wiz_active_specs']
+    source_map   = context.user_data.get('wiz_source_map') or                    _wiz.build_source_map(active_specs, context.user_data.get('wiz_recognized', []))
+    drawings_id  = context.user_data.get('wiz_drawings_id')
+    project_name = f"{folder_name} - наряды"
+
+    # ── Прогресс-экран ────────────────────────────────────────────────────────
+    # Шаги: (название, нужны_чертежи)
+    STEPS = [
+        ("Создание таблицы",            False),
+        ("Регистрация проекта",         False),
+        ("Настройка вкладок",           False),
+        ("Служебные вкладки",           False),
+        ("Зависимости между этапами",   False),
+        ("Загрузка данных из Excel",    False),
+        ("Выпадающие списки",           False),
+        ("Активация проекта",           False),
+    ]
+    active_steps = [(name, req) for name, req in STEPS]
+
+    def _render(current: int, done_up_to: int, error_at: int = -1) -> str:
+        lines = [f"*Создание проекта «{project_name}»*\n"]
+        for i, (name, _) in enumerate(active_steps):
+            if i < done_up_to:
+                lines.append(f"✅  {name}")
+            elif i == current and error_at == i:
+                lines.append(f"❌  {name}")
+            elif i == current:
+                lines.append(f"⏳  *{name}...*")
+            else:
+                lines.append(f"◻️  {name}")
+        return "\n".join(lines)
+
+    async def _upd(current: int, done_up_to: int, err: int = -1):
+        await query.message.edit_text(
+            _render(current, done_up_to, err), parse_mode="Markdown"
+        )
+
+    # ── Шаг 0: Создание таблицы ───────────────────────────────────────────────
+    si = 0
+    await _upd(si, si)
+    try:
+        sheet_id = _wiz.create_spreadsheet(project_name, folder_id)
+    except Exception as e:
+        app_logger.alert(f"wizard create_spreadsheet error: {e}")
+        await _upd(si, si, err=si)
+        await query.message.edit_text(f"❌ Не удалось создать таблицу:\n{e}")
+        return ConversationHandler.END
+
+    # ── Шаг 1: Регистрация (статус СОЗДАНИЕ — sync не видит) ─────────────────
+    si = 1
+    await _upd(si, si)
+    try:
+        proj = _wiz.register_project(
+            project_name=project_name,
+            folder_id=folder_id,
+            sheet_id=sheet_id,
+            drawings_folder_id=drawings_id,
+            active_specs=active_specs,
+            created_by=user.id,
+            status='СОЗДАНИЕ',
+        )
+        if not proj['ok']:
+            await query.message.edit_text(f"❌ {proj['error']}")
+            return ConversationHandler.END
+        project_id = proj['id']
+    except Exception as e:
+        app_logger.alert(f"wizard register_project error: {e}")
+        await query.message.edit_text(f"❌ Ошибка при регистрации:\n{e}")
+        return ConversationHandler.END
+
+    # ── Шаг 2: Вкладки специализаций ──────────────────────────────────────────
+    si = 2
+    await _upd(si, si)
+    try:
+        _wiz.setup_sheet_tabs(sheet_id, active_specs)
+    except Exception as e:
+        app_logger.alert(f"wizard setup_sheet_tabs error: {e}")
+        await query.message.edit_text(f"❌ Ошибка при создании вкладок:\n{e}")
+        return ConversationHandler.END
+
+    # ── Шаг 3: Служебные вкладки ──────────────────────────────────────────────
+    si = 3
+    await _upd(si, si)
+    try:
+        _wiz.setup_service_tabs(sheet_id, active_specs)
+    except Exception as e:
+        app_logger.alert(f"wizard setup_service_tabs error: {e}")
+        await query.message.edit_text(f"❌ Ошибка при создании служебных вкладок:\n{e}")
+        return ConversationHandler.END
+
+    # ── Шаг 4: Зависимости ────────────────────────────────────────────────────
+    si = 4
+    await _upd(si, si)
+    try:
+        _wiz.fill_deps_sheet(sheet_id, active_specs)
+    except Exception as e:
+        app_logger.alert(f"wizard fill_deps_sheet error: {e}")
+
+    # ── Шаг 5: Загрузка данных из Excel ───────────────────────────────────────
+    si = 5
+    await _upd(si, si)
+    try:
+        _ref_files = [item['file'] for item in context.user_data.get('wiz_recognized', [])
+                      if 'СПРАВОЧНИК' in item.get('specs', [])]
+        counts = _wiz.load_excel_data(sheet_id, source_map, reference_files=_ref_files)
+    except Exception as e:
+        app_logger.alert(f"wizard load_excel_data error: {e}")
+        await query.message.edit_text(f"❌ Ошибка при загрузке данных:\n{e}")
+        return ConversationHandler.END
+
+    # ── Шаг 6: Выпадающие списки ──────────────────────────────────────────────
+    si = 6
+    await _upd(si, si)
+    try:
+        _wiz.add_data_validations(sheet_id, active_specs, counts)
+    except Exception as e:
+        app_logger.alert(f"wizard add_data_validations error: {e}")
+
+    # Нарезка PDF и привязка чертежей — отложено, см. ветку feature/pdf-naryad
+    cut_count  = 0
+    link_count = 0
+    # ── Последний шаг: активация (проект становится виден для sync) ────────────
+    si = len(active_steps) - 1
+    await _upd(si, si)
+    try:
+        _wiz.activate_project(project_id)
+    except Exception as e:
+        app_logger.alert(f"wizard activate_project error: {e}")
+        await query.message.edit_text(f"❌ Ошибка при активации проекта:\n{e}")
+        return ConversationHandler.END
+
+    # Итоговое сообщение
+    rows_txt = "\n".join(f"  • {spec}: {cnt} строк" for spec, cnt in counts.items()) if counts else "  (нет данных)"
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+
+    drawings_txt = ""
+
+    await query.message.edit_text(
+        f"✅ *Проект создан!*\n\n"
+        f"📁 {folder_name}\n"
+        f"🔗 [Открыть таблицу]({sheet_url})\n\n"
+        f"Загружено:\n{rows_txt}{drawings_txt}\n\n"
         f"Данные появятся у рабочих после следующей синхронизации (до 15 мин).",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🗂 К проектам", callback_data="projects"),
             InlineKeyboardButton("← Меню", callback_data="menu"),
-        ]])
+        ]]),
+        parse_mode="Markdown"
     )
+
+    # Очищаем wizard-данные из user_data
+    for k in ['wiz_folder_id', 'wiz_folder_name', 'wiz_recognized', 'wiz_drawings_id', 'wiz_active_specs', 'wiz_all_specs', 'wiz_source_map']:
+        context.user_data.pop(k, None)
+
     return ConversationHandler.END
 
 
@@ -2101,6 +2714,15 @@ def main():
             WAITING_PROJECT_LINK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_project_link)
             ],
+            WAITING_WIZARD_SPECS: [
+                CallbackQueryHandler(wizard_toggle_spec, pattern=r'^wiz_toggle:'),
+                CallbackQueryHandler(wizard_next,        pattern=r'^wiz_next$'),
+            ],
+            WAITING_WIZARD_SOURCES: [
+                CallbackQueryHandler(wizard_toggle_source, pattern=r'^wiz_src_toggle:'),
+                CallbackQueryHandler(wizard_sources_back,  pattern=r'^wiz_sources_back$'),
+                CallbackQueryHandler(wizard_create,        pattern=r'^wiz_create$'),
+            ],
         },
         fallbacks=[CommandHandler('cancel', cmd_cancel)],
         per_message=False,
@@ -2132,6 +2754,7 @@ def main():
     app.add_handler(partial_conv)
     app.add_handler(block_conv)
     app.add_handler(project_conv)
+    app.add_handler(CallbackQueryHandler(wizard_cut_drawings, pattern=r'^wiz_cut_drawings$'))
     app.add_handler(earnings_conv)
     app.add_handler(correction_conv)
     app.add_handler(CallbackQueryHandler(on_callback))
