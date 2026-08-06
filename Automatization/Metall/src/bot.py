@@ -190,7 +190,11 @@ def get_active_tasks(worker_name: str, specialization: str = None):
     )
     for t in tasks:
         if t['sheet_name'].upper() in SHEETS_WITH_DEPS:
-            t['deps_ready'] = _deps_ready(t['project_name'], t['element'], t['sheet_name'])
+            try:
+                t['deps_ready'] = _deps_ready(t['project_name'], t['element'], t['sheet_name'])
+            except Exception as e:
+                app_logger.alert(f"_deps_ready error task_id={t['id']} element={t['element']}: {e}")
+                t['deps_ready'] = True
         else:
             t['deps_ready'] = True
     return tasks
@@ -1433,8 +1437,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Задача не найдена.", reply_markup=back_to_tasks_kb())
             return
 
-        if task['sheet_name'].upper() in SHEETS_WITH_DEPS and not _deps_ready(task['project_name'], task['element'], task['sheet_name']):
-            blocking = _deps_blocking(task['project_name'], task['element'], task['sheet_name'])
+        try:
+            _task_deps_ready = task['sheet_name'].upper() not in SHEETS_WITH_DEPS or _deps_ready(task['project_name'], task['element'], task['sheet_name'])
+            _task_blocking = [] if _task_deps_ready else _deps_blocking(task['project_name'], task['element'], task['sheet_name'])
+        except Exception as e:
+            app_logger.alert(f"_deps_ready/_deps_blocking error task_id={task_id}: {e}")
+            _task_deps_ready = True
+            _task_blocking = []
+        if not _task_deps_ready:
+            blocking = _task_blocking
             lines = ["⏳ Задача ещё не доступна", f"Элемент: {task['element']}", "Ожидает выполнения:"]
             for b in blocking:
                 lines.append(f"  ☐ {b}")
