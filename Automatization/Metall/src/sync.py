@@ -354,21 +354,31 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
     pokraska  = get_elems('ПОКРАСКА',  'Марка')
 
     deps = []
-    plazma_upper     = {e.upper(): e for e in plazma}
-    sborka_via_sverl = sborka & sverlenie
+    plazma_upper = {e.upper(): e for e in plazma}
 
+    # СВЕРЛЕНИЕ <- ПИЛА (прямое) + ПЛАЗМА (last-word)
     for e in sverlenie & pila:
         deps.append(('СВЕРЛЕНИЕ', e, 'ПИЛА', e))
-    for e in sborka & sverlenie:
-        deps.append(('СБОРКА', e, 'СВЕРЛЕНИЕ', e))
-    for e in (sborka & pila) - sborka_via_sverl:
+    for se in sverlenie:
+        pm = plazma_upper.get(se.split()[-1].upper())
+        if pm:
+            deps.append(('СВЕРЛЕНИЕ', se, 'ПЛАЗМА', pm))
+
+    # СБОРКА <- ПИЛА (прямое) + ПЛАЗМА (last-word), НЕ зависит от СВЕРЛЕНИЯ
+    for e in sborka & pila:
         deps.append(('СБОРКА', e, 'ПИЛА', e))
-    for se in sborka - sborka_via_sverl:
+    for se in sborka:
         pm = plazma_upper.get(se.split()[-1].upper())
         if pm:
             deps.append(('СБОРКА', se, 'ПЛАЗМА', pm))
+
+    # СВАРКА <- СБОРКА + СВЕРЛЕНИЕ (оба должны быть выполнены)
     for e in svarka & sborka:
         deps.append(('СВАРКА', e, 'СБОРКА', e))
+    for e in svarka & sverlenie:
+        deps.append(('СВАРКА', e, 'СВЕРЛЕНИЕ', e))
+
+    # ГРУНТОВКА <- СВАРКА, ПОКРАСКА <- ГРУНТОВКА
     for e in grunt & svarka:
         deps.append(('ГРУНТОВКА', e, 'СВАРКА', e))
     for e in pokraska & grunt:

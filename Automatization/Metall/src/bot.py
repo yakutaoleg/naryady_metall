@@ -190,21 +190,28 @@ def get_active_tasks(worker_name: str, specialization: str = None):
     )
     for t in tasks:
         if t['sheet_name'].upper() in SHEETS_WITH_DEPS:
-            t['deps_ready'] = _deps_ready(t['project_name'], t['element'])
+            t['deps_ready'] = _deps_ready(t['project_name'], t['element'], t['sheet_name'])
         else:
             t['deps_ready'] = True
     return tasks
 
 
-def _deps_ready(project_name: str, element: str) -> bool:
+def _deps_ready(project_name: str, element: str, sheet_name: str = None) -> bool:
     """Возвращает True если все зависимости для элемента выполнены (или зависимостей нет)."""
     if not element:
         return True
-    deps = db.fetchall(
-        """SELECT requires_sheet, requires_position FROM element_dependencies
-           WHERE project_name=%s AND element=%s""",
-        [project_name, element]
-    )
+    if sheet_name:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s AND waiting_sheet=%s""",
+            [project_name, element, sheet_name]
+        )
+    else:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s""",
+            [project_name, element]
+        )
     if not deps:
         return True
     for dep in deps:
@@ -215,9 +222,39 @@ def _deps_ready(project_name: str, element: str) -> bool:
             [project_name, dep['requires_sheet'], dep['requires_position']]
         )
         # Нет строк — upstream не заведён, считаем что не блокирует
-        if rows and any(r['status'] != 'ВЫПОЛНЕНО' for r in rows):
+        # Достаточно хотя бы одной ВЫПОЛНЕНО строки (частичное выполнение не блокирует)
+        if rows and not any(r['status'] == 'ВЫПОЛНЕНО' for r in rows):
             return False
     return True
+
+
+def _deps_blocking(project_name: str, element: str, sheet_name: str = None) -> list[str]:
+    """Возвращает список незакрытых зависимостей в виде читаемых строк."""
+    if not element:
+        return []
+    if sheet_name:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s AND waiting_sheet=%s""",
+            [project_name, element, sheet_name]
+        )
+    else:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s""",
+            [project_name, element]
+        )
+    blocking = []
+    for dep in deps:
+        rows = db.fetchall(
+            """SELECT status FROM work_orders
+               WHERE project_name=%s AND sheet_name=%s AND element=%s""",
+            [project_name, dep['requires_sheet'], dep['requires_position']]
+        )
+        if rows and not any(r['status'] == 'ВЫПОЛНЕНО' for r in rows):
+            done = sum(1 for r in rows if r['status'] == 'ВЫПОЛНЕНО')
+            blocking.append(f"{dep['requires_sheet']}: {dep['requires_position']} ({done}/{len(rows)} вып.)")
+    return blocking
 
 
 async def _notify_worker_unblocked(bot, executor: str, position: str, element: str):
@@ -566,7 +603,7 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     multi_spec = len({t['sheet_name'] for t in tasks}) > 1
     for t in tasks:
         if not t.get('deps_ready', True):
-            prefix = "☐ "
+            prefix = "⛔ "
         elif t['mandatory']:
             prefix = "❗ "
         elif mandatory_left:
@@ -579,12 +616,14 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
         else:
             qty_str = str(int(t['quantity'])) if t['quantity'] else '?'
         spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
-        label = f"{prefix}{spec_tag}{t['position']} — {t['element'] or ''} × {qty_str}"
+        pos_part = f"{t['position']} — " if t['position'] else ""
+        label = f"{prefix}{spec_tag}{pos_part}{t['element'] or ''} × {qty_str}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"task:{t['id']}")])
 
     for t in blocked:
         spec_tag = f"[{t['sheet_name']}] " if len({b['sheet_name'] for b in blocked}) > 1 else ""
-        label = f"⛔ {spec_tag}{t['position']} — {t['element'] or ''} (заблок.)"
+        pos_part2 = f"{t['position']} — " if t['position'] else ""
+        label = f"⛔ {spec_tag}{pos_part2}{t['element'] or ''} (заблок.)"
         buttons.append([InlineKeyboardButton(label, callback_data="blocked_info")])
 
     buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
@@ -826,20 +865,23 @@ async def show_tasks(update: Update, worker_name: str, specialization: str = Non
         lines.append("❗ Обязательные:")
         for t in mandatory_tasks:
             spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
-            lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"  • {spec_tag}{pos_part}{t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if optional_tasks:
         lock = " 🔒 (после обязательных)" if mandatory_left else ""
         lines.append(f"\nОстальные{lock}:")
         for t in optional_tasks:
             spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
-            lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"  • {spec_tag}{pos_part}{t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if blocked:
         lines.append("\n⛔ Заблокированные (снимает руководитель):")
         for t in blocked:
             comment = f" — {t['comment']}" if t['comment'] else ""
-            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"  • {pos_part}{t['element'] or ''}{comment}")
 
     lines.append("\n👇 Нажмите на задачу:")
     tasks_text = "\n".join(lines)
@@ -855,7 +897,8 @@ async def show_task_detail(update: Update, task: dict, specialization: str):
 
     lines = []
     mandatory_mark = "❗ " if task['mandatory'] else ""
-    lines.append(f"{mandatory_mark}[{task['sheet_name']}] {task['position']}")
+    _pos = task['position'] or task['element'] or ''
+    lines.append(f"{mandatory_mark}[{task['sheet_name']}] {_pos}")
     lines.append(f"Элемент: {task['element'] or '—'}")
     lines.append(f"Проект: {task['project_name']}")
     qty_done_val = task.get('qty_done') or 0
@@ -897,7 +940,8 @@ async def show_done_today(update: Update, worker_name: str, specialization: str)
         lines = [f"✅ Выполнено сегодня ({TODAY()}) — {len(tasks)} шт:\n"]
         for t in tasks:
             pay = f"  |  {t['payment_sum']} руб" if t['payment_sum'] else ""
-            lines.append(f"✅ {t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт{pay}")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"✅ {pos_part}{t['element'] or ''} × {t['quantity'] or '?'} шт{pay}")
         if total > 0:
             lines.append(f"\n💵 Итого за день: {total:.2f} руб")
         text = "\n".join(lines)
@@ -1389,10 +1433,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Задача не найдена.", reply_markup=back_to_tasks_kb())
             return
 
-        if task['sheet_name'].upper() in SHEETS_WITH_DEPS and not _deps_ready(task['project_name'], task['element']):
-            await query.answer(
-                f"☐ Ожидает готовности предыдущего этапа.",
-                show_alert=True
+        if task['sheet_name'].upper() in SHEETS_WITH_DEPS and not _deps_ready(task['project_name'], task['element'], task['sheet_name']):
+            blocking = _deps_blocking(task['project_name'], task['element'], task['sheet_name'])
+            lines = ["⏳ Задача ещё не доступна", f"Элемент: {task['element']}", "Ожидает выполнения:"]
+            for b in blocking:
+                lines.append(f"  ☐ {b}")
+            await query.answer()
+            await query.edit_message_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← К задачам", callback_data="tasks")]])
             )
             return
 
@@ -1412,7 +1461,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         app_logger.audit('view_task', user.id, user.username, {'task_id': task_id}, 'success')
-        await show_task_detail(update, task, specialization)
+        try:
+            await show_task_detail(update, task, specialization)
+        except Exception as e:
+            app_logger.alert(f"show_task_detail error task_id={task_id}: {e}")
+            await query.edit_message_text(
+                "⚠️ Не удалось открыть задачу. Администратор уведомлён.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← К задачам", callback_data="tasks")]])
+            )
 
     elif data.startswith("done:"):
         task_id = int(data.split(":")[1])
