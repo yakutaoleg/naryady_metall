@@ -16,6 +16,7 @@ load_dotenv('/root/naryady/prod/.env')
 
 import src.sheets as sh
 import src.sheet_standards as std
+from src import db
 
 TG_TOKEN    = os.environ['TG_TOKEN']
 ADMIN_CHAT  = 340620064
@@ -33,6 +34,16 @@ SHEETS_CONFIG = {
 SKIP_FONT_CHECK = {'СТАТУС', 'ОБЯЗАТЕЛЬНАЯ', 'ИСПОЛНИТЕЛЬ', 'БЛОК'}
 ALLOWED_BG = {'FFFFFF', 'FFF9C4', 'E8F5E9', 'FFE0B2', 'FFEBEE', 'EEEEEE', 'EFEFEF'}
 
+# Следующая специализация по цепочке (для проверки колонки БЛОК)
+NEXT_SPEC = {
+    'ПЛАЗМА':    'СВЕРЛЕНИЕ',
+    'ПИЛА':      'СВЕРЛЕНИЕ',
+    'СВЕРЛЕНИЕ': 'СБОРКА',
+    'СБОРКА':    'СВАРКА',
+    'СВАРКА':    'ГРУНТОВКА',
+    'ГРУНТОВКА': 'ПОКРАСКА',
+}
+
 # Категории для группировки — (ключ, метка)
 CATEGORIES = [
     ('ВЫПОЛНЕНО_БЕЗ_ДАТЫ',       'ВЫПОЛНЕНО без ДАТА ФАКТ'),
@@ -47,6 +58,8 @@ CATEGORIES = [
     ('ИТОГО_БЛОК',                'В строке ИТОГО заполнен БЛОК'),
     ('ОФОРМЛЕНИЕ',                'Нестандартное оформление строки'),
     ('ТИП_ДАННЫХ',                'Неверный тип данных в ячейке'),
+    ('БЛОК_КОЛОНКА',              'Колонка БЛОК: неактуальная информация'),
+    ('БЛОК_ЗАВИСАНИЕ',            'БЛОК-зависание: зависимость уже выполнена'),
 ]
 CAT_KEYS = {k for k, _ in CATEGORIES}
 
@@ -295,6 +308,53 @@ def check_sheet(sheet_name, cfg):
             if val and not is_date(val):
                 issues.append('ТИП_ДАННЫХ | ' + ref + ' «' + cn + '»: ожидается дата, получено «' + val + '»')
 
+        # Правило B: проверяем колонку БЛОК
+        blok_col = col_map.get('БЛОК')
+        blok_val = cv(blok_col) if blok_col else ''
+        expected_blok = '⛔ ' + NEXT_SPEC[sheet_name.upper()] if sheet_name.upper() in NEXT_SPEC else ''
+
+        if status == 'ВЫПОЛНЕНО' and blok_val:
+            issues.append('БЛОК_КОЛОНКА | ' + ref + ': ВЫПОЛНЕНО, БЛОК = «' + blok_val + '»')
+        elif status == 'БЛОК' and expected_blok and blok_val and blok_val != expected_blok:
+            issues.append('БЛОК_КОЛОНКА | ' + ref + ': БЛОК = «' + blok_val + '», ожидается «' + expected_blok + '»')
+
+    return issues
+
+
+def check_dep_hangups(project_name: str) -> list:
+    """Правило A: задача в БЛОК, но все зависимости уже ВЫПОЛНЕНЫ → зависание."""
+    issues = []
+    try:
+        blocked = db.fetchall(
+            """SELECT wo.element, wo.sheet_name, wo.row_num
+               FROM work_orders wo
+               WHERE wo.project_name=%s AND wo.status='БЛОК'
+                 AND wo.element IS NOT NULL
+                 AND EXISTS (
+                   SELECT 1 FROM element_dependencies ed
+                   WHERE ed.project_name=wo.project_name AND ed.element=wo.element
+                 )""",
+            [project_name]
+        )
+        for task in blocked:
+            deps = db.fetchall(
+                """SELECT requires_sheet, requires_position FROM element_dependencies
+                   WHERE project_name=%s AND element=%s""",
+                [project_name, task['element']]
+            )
+            all_done = all(
+                (db.fetchone(
+                    """SELECT COUNT(*) as cnt FROM work_orders
+                       WHERE project_name=%s AND sheet_name=%s AND element=%s AND status != 'ВЫПОЛНЕНО'""",
+                    [project_name, d['requires_sheet'], d['requires_position']]
+                ) or {}).get('cnt', 1) == 0
+                for d in deps
+            ) if deps else False
+            if all_done:
+                ref = task['sheet_name'] + ' стр.' + str(task['row_num']) + ' «' + task['element'] + '»'
+                issues.append('БЛОК_ЗАВИСАНИЕ | ' + ref + ': в БЛОК, но зависимости ВЫПОЛНЕНО')
+    except Exception as e:
+        issues.append('БЛОК_ЗАВИСАНИЕ | Ошибка проверки: ' + str(e))
     return issues
 
 
@@ -363,6 +423,16 @@ def main():
             all_issues.extend(issues)
         except Exception as e:
             all_issues.append('ПРОЧЕЕ | ' + sheet_name + ': ошибка проверки — ' + str(e))
+
+    # Правило A: зависания БЛОК (кросс-листовая проверка через БД)
+    try:
+        project = db.fetchone(
+            "SELECT project_name FROM projects WHERE sheet_id=%s", [FILE_ID]
+        )
+        if project:
+            all_issues.extend(check_dep_hangups(project['project_name']))
+    except Exception as e:
+        all_issues.append('ПРОЧЕЕ | Зависания: ошибка — ' + str(e))
 
     if not all_issues:
         save_state(set())

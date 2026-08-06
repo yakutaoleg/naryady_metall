@@ -208,13 +208,14 @@ def _deps_ready(project_name: str, element: str) -> bool:
     if not deps:
         return True
     for dep in deps:
-        row = db.fetchone(
+        # Проверяем по element (не position): все строки с этим элементом в upstream листе
+        rows = db.fetchall(
             """SELECT status FROM work_orders
-               WHERE project_name=%s AND sheet_name=%s AND position=%s
-               LIMIT 1""",
+               WHERE project_name=%s AND sheet_name=%s AND element=%s""",
             [project_name, dep['requires_sheet'], dep['requires_position']]
         )
-        if not row or row['status'] != 'ВЫПОЛНЕНО':
+        # Нет строк — upstream не заведён, считаем что не блокирует
+        if rows and any(r['status'] != 'ВЫПОЛНЕНО' for r in rows):
             return False
     return True
 
@@ -269,16 +270,19 @@ async def _notify_masters_dep_unblocked(bot, project_name: str, waiting_sheet: s
 
 
 async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
-                                 completed_position: str, qty_done: int):
+                                 completed_position: str, qty_done: int,
+                                 completed_element: str = None):
     """Вызывается когда задача перешла в ЧАСТИЧНО или ВЫПОЛНЕНО.
     Ищет заблокированные задачи следующего уровня и разбивает их."""
     from src import sheets as _sheets
     import uuid as _uuid
 
+    # Сопоставляем по element (не position): completed_element — код сборочной единицы
+    match_key = completed_element or completed_position
     waiting_deps = db.fetchall(
         """SELECT DISTINCT waiting_sheet, element FROM element_dependencies
            WHERE project_name=%s AND requires_sheet=%s AND requires_position=%s""",
-        [project_name, completed_sheet, completed_position]
+        [project_name, completed_sheet, match_key]
     )
     if not waiting_deps:
         return
@@ -351,6 +355,8 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                         _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _tw_plan)
                     if _ps_plan:
                         _sheets.update_cell_by_header(task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_plan)
+                    from src.sheets import _NEXT_SPEC
+                    _next = _NEXT_SPEC.get(task['sheet_name'].upper(), '')
                     remainder_data = {
                         'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': task['position'] or '',
                         'ЭЛЕМЕНТ':               task['element'] or '',
@@ -359,6 +365,7 @@ async def notify_deps_unblocked(bot, project_name: str, completed_sheet: str,
                         'МАССА ВСЕХ (кг)':      _tw_block if _tw_block else '',
                         'СУММА К ОПЛАТЕ':       _ps_block if _ps_block else '',
                         'СТАТУС':               'БЛОК',
+                        'БЛОК':                 f'⛔ {_next}' if _next else '',
                         'ОБЯЗАТЕЛЬНАЯ':         'НЕТ',
                         'ИСПОЛНИТЕЛЬ':          task['executor'] or '',
                         'ROW_ID':               new_row_id,
@@ -952,7 +959,7 @@ SHEET_ICONS = {
     'ГРУНТОВКА': '🖌', 'ПОКРАСКА': '🎨',
 }
 
-SHEETS_WITH_DEPS = {'СБОРКА'}
+SHEETS_WITH_DEPS = {'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА'}
 
 def plans_date_kb(date_str: str, page: int = 0, total_pages: int = 1):
     from datetime import timedelta
@@ -1406,11 +1413,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     app_logger.alert(f"notify_assembly_workers error: {e}")
 
         # 4. Разблокируем зависимые задачи следующего уровня
-        if task.get('position') and task.get('project_name'):
+        if task.get('project_name'):
             try:
                 await notify_deps_unblocked(
                     context.bot, task['project_name'], task['sheet_name'],
-                    task['position'], int(task['quantity'] or 0)
+                    task['position'], int(task['quantity'] or 0),
+                    completed_element=task.get('element'),
                 )
             except Exception as e:
                 app_logger.alert(f"notify_deps_unblocked error: {e}")
@@ -1985,7 +1993,8 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await notify_deps_unblocked(
             context.bot, task['project_name'], task['sheet_name'],
-            task['position'], qty_new
+            task['position'], qty_new,
+            completed_element=task.get('element'),
         )
     except Exception as e:
         app_logger.alert(f"notify_deps_unblocked (partial) error: {e}")
