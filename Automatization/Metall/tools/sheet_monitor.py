@@ -64,6 +64,7 @@ CATEGORIES = [
     ('БЛОК_КОЛОНКА',              'Колонка БЛОК: неактуальная информация'),
     ('БЛОК_ЗАВИСАНИЕ',            'БЛОК-зависание: зависимость уже выполнена'),
     ('ЗАВИСИМОСТИ_ЗДОРОВЬЕ',      'Зависимости: сбой автогенерации'),
+    ('ЧАСТИЧНО_БЕЗ_ВЫПОЛНЕНО',   'ЧАСТИЧНО без заполненного ВЫПОЛНЕНО'),
 ]
 CAT_KEYS = {k for k, _ in CATEGORIES}
 
@@ -145,6 +146,7 @@ def categorize(issue_text):
     if t.startswith('БЛОК_КОЛОНКА')  : return 'БЛОК_КОЛОНКА'
     if t.startswith('БЛОК_ЗАВИСАНИЕ'): return 'БЛОК_ЗАВИСАНИЕ'
     if t.startswith('ЗАВИСИМОСТИ')   : return 'ЗАВИСИМОСТИ_ЗДОРОВЬЕ'
+    if t.startswith('ЧАСТИЧНО')      : return 'ЧАСТИЧНО_БЕЗ_ВЫПОЛНЕНО'
     return 'ПРОЧЕЕ'
 
 
@@ -312,6 +314,12 @@ def check_sheet(sheet_name, cfg):
             val = cv(col_map.get(cn))
             if val and not is_date(val):
                 issues.append('ТИП_ДАННЫХ | ' + ref + ' «' + cn + '»: ожидается дата, получено «' + val + '»')
+
+        # Правило: ЧАСТИЧНО без ВЫПОЛНЕНО
+        vyp_col = col_map.get('ВЫПОЛНЕНО')
+        vyp_val = cv(vyp_col) if vyp_col else ''
+        if status == 'ЧАСТИЧНО' and (not vyp_val or vyp_val in ('0', '0.000', '0,000')):
+            issues.append('ЧАСТИЧНО_БЕЗ_ВЫПОЛНЕНО | ' + ref + ': ЧАСТИЧНО, ВЫПОЛНЕНО не заполнено')
 
         # Правило B: проверяем колонку БЛОК
         blok_col = col_map.get('БЛОК')

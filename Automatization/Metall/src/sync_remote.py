@@ -35,6 +35,7 @@ def _normalize_row(row: dict, sheet_name: str, row_num: int,
         'comment':      row.get('КОММЕНТАРИЙ', '').strip() or None,
         'date_fact':    _parse_date(row.get('ДАТА ФАКТ')),
         'drawing_link': row.get('ССЫЛКА НА ЧЕРТЁЖ', '').strip() or None,
+        'qty_done':     _to_float(row.get('ВЫПОЛНЕНО', '') or 0) or None,
     }
 
 UPSERT_SQL = '''
@@ -42,12 +43,12 @@ INSERT INTO work_orders (
     project_name, file_id, sheet_name, row_num,
     position, element, quantity, unit_weight, total_weight, payment_sum,
     executor, date_plan, priority, mandatory, status, comment, date_fact,
-    drawing_link, updated_at
+    drawing_link, qty_done, updated_at
 ) VALUES (
     %(project_name)s, %(file_id)s, %(sheet_name)s, %(row_num)s,
     %(position)s, %(element)s, %(quantity)s, %(unit_weight)s, %(total_weight)s, %(payment_sum)s,
     %(executor)s, %(date_plan)s, %(priority)s, %(mandatory)s, %(status)s, %(comment)s, %(date_fact)s,
-    %(drawing_link)s, NOW()
+    %(drawing_link)s, %(qty_done)s, NOW()
 )
 ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
     position     = EXCLUDED.position,
@@ -67,7 +68,9 @@ ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
     comment = CASE WHEN work_orders.status IN ('ВЫПОЛНЕНО','БЛОК')
                    THEN work_orders.comment ELSE EXCLUDED.comment END,
     date_fact = CASE WHEN work_orders.status IN ('ВЫПОЛНЕНО','БЛОК')
-                     THEN work_orders.date_fact ELSE EXCLUDED.date_fact END
+                     THEN work_orders.date_fact ELSE EXCLUDED.date_fact END,
+    qty_done = CASE WHEN work_orders.status IN ('ВЫПОЛНЕНО','БЛОК')
+                    THEN work_orders.qty_done ELSE EXCLUDED.qty_done END
 '''
 
 def run():
@@ -117,6 +120,13 @@ def run():
                 [f['id']]
             )
 
+    # Обработка ручных ЧАСТИЧНО: сплит на ВЫПОЛНЕНО + остаток
+    for f in files:
+        try:
+            _process_partial_splits(f['project_name'])
+        except Exception as e:
+            logger.error(f'  Partial split error ({f["project_name"]}): {e}')
+
     # Автогенерация зависимостей из данных листов
     for f in files:
         try:
@@ -133,6 +143,110 @@ def run():
 
     logger.info(f'Sync done. Total: {total_synced} rows')
     return total_synced
+
+
+def _process_partial_splits(project_name: str):
+    """Обрабатывает строки со статусом ЧАСТИЧНО заполненные вручную в Sheets:
+    разбивает на ВЫПОЛНЕНО (qty_done шт) + строку-остаток (ПЛАН)."""
+    import uuid as _uuid
+
+    tasks = db.fetchall(
+        """SELECT id, file_id, sheet_name, row_num, position, element,
+                  quantity, qty_done, unit_weight, total_weight, payment_sum,
+                  drawing_link, date_plan, date_fact, executor
+           FROM work_orders
+           WHERE project_name=%s AND status='ЧАСТИЧНО'
+             AND qty_done IS NOT NULL AND qty_done > 0
+             AND quantity IS NOT NULL AND qty_done < quantity""",
+        [project_name]
+    )
+    if not tasks:
+        return
+
+    split_count = 0
+    for task in tasks:
+        qty_done  = float(task['qty_done'])
+        qty_total = float(task['quantity'])
+        remaining = qty_total - qty_done
+        orig_qty  = qty_total
+
+        _tw_done    = round(float(task['total_weight'] or 0) / orig_qty * qty_done,    3) if task['total_weight'] else None
+        _ps_done    = round(float(task['payment_sum']  or 0) / orig_qty * qty_done,    2) if task['payment_sum']  else None
+        _tw_remain  = round(float(task['total_weight'] or 0) / orig_qty * remaining,   3) if task['total_weight'] else None
+        _ps_remain  = round(float(task['payment_sum']  or 0) / orig_qty * remaining,   2) if task['payment_sum']  else None
+        new_row_id  = str(_uuid.uuid4())
+        date_fact   = task['date_fact'].strftime('%d.%m.%Y') if task['date_fact'] else ''
+
+        # Обновляем текущую строку в БД → ВЫПОЛНЕНО
+        db.execute(
+            """UPDATE work_orders
+               SET status='ВЫПОЛНЕНО', quantity=%s, qty_done=%s,
+                   total_weight=%s, payment_sum=%s, updated_at=NOW()
+               WHERE id=%s AND status='ЧАСТИЧНО'""",
+            [qty_done, qty_done, _tw_done, _ps_done, task['id']]
+        )
+
+        # Вставляем строку-остаток в БД (row_num=-id как placeholder)
+        db.execute(
+            """INSERT INTO work_orders
+               (project_name, file_id, sheet_name, row_num, row_id,
+                position, element, quantity, unit_weight, total_weight, payment_sum,
+                executor, date_plan, priority, mandatory, status, drawing_link)
+               SELECT project_name, file_id, sheet_name, -%s, %s,
+                      position, element, %s, unit_weight, %s, %s,
+                      NULL, date_plan, priority, true, 'ПЛАН', drawing_link
+               FROM work_orders WHERE id=%s""",
+            [task['id'], new_row_id, remaining, _tw_remain, _ps_remain, task['id']]
+        )
+
+        # Обновляем Sheets: текущая строка → ВЫПОЛНЕНО
+        try:
+            sheets.update_task_status(
+                file_id=task['file_id'], sheet_name=task['sheet_name'],
+                row_num=task['row_num'], status='ВЫПОЛНЕНО',
+                date_fact=date_fact, qty_done=int(qty_done),
+            )
+            sheets.update_cell_by_header(
+                task['file_id'], task['sheet_name'], task['row_num'], 'КОЛ-ВО', qty_done
+            )
+            if _tw_done is not None:
+                sheets.update_cell_by_header(
+                    task['file_id'], task['sheet_name'], task['row_num'], 'МАССА ВСЕХ (кг)', _tw_done
+                )
+            if _ps_done is not None:
+                sheets.update_cell_by_header(
+                    task['file_id'], task['sheet_name'], task['row_num'], 'СУММА К ОПЛАТЕ', _ps_done
+                )
+
+            # Вставляем строку-остаток в Sheets
+            _uw = float(task['unit_weight'] or 0) or None
+            remainder_data = {
+                'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': task['position'] or '',
+                'ЭЛЕМЕНТ':               task['element'] or '',
+                'КОЛ-ВО':               remaining,
+                'МАССА ЕД. (кг)':       _uw if _uw is not None else '',
+                'МАССА ВСЕХ (кг)':      _tw_remain if _tw_remain is not None else '',
+                'СУММА К ОПЛАТЕ':       _ps_remain if _ps_remain is not None else '',
+                'СТАТУС':               'ПЛАН',
+                'ОБЯЗАТЕЛЬНАЯ':         'НЕТ',
+                'ИСПОЛНИТЕЛЬ':          '',
+                'ROW_ID':               new_row_id,
+                'ССЫЛКА НА ЧЕРТЁЖ':    task['drawing_link'] or '',
+            }
+            sheets.insert_remainder_row(
+                task['file_id'], task['sheet_name'], task['row_num'], remainder_data
+            )
+            split_count += 1
+            logger.info(
+                f'  Partial split: {task["sheet_name"]} row {task["row_num"]} '
+                f'({task["position"]} / {task["element"]}) '
+                f'→ ВЫПОЛНЕНО {int(qty_done)} шт + остаток {remaining} шт'
+            )
+        except Exception as e:
+            logger.error(f'  Partial split Sheets error (id={task["id"]}): {e}')
+
+    if split_count:
+        logger.info(f'  Partial splits ({project_name}): обработано {split_count} строк')
 
 
 def _rebuild_element_dependencies(project_name: str, file_id: str):
