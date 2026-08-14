@@ -326,16 +326,46 @@ def _upsert_employees(rows: list[dict], sheet_name: str):
 
 
 def _rebuild_element_dependencies(project_name: str, file_id: str):
-    """Автогенерирует element_dependencies из реальных данных листов."""
+    """Синхронизирует element_dependencies из листа ЗАВИСИМОСТИ (если есть), иначе авто-генерирует."""
+
+    try:
+        ws_z = sheets._ws(file_id, 'ЗАВИСИМОСТИ')
+        z_data = sheets._api_call(ws_z.get_all_values)
+        if len(z_data) > 1:
+            deps_from_sheet = []
+            for row in z_data[1:]:
+                if len(row) >= 5 and row[1].strip() and row[2].strip() and row[3].strip() and row[4].strip():
+                    deps_from_sheet.append((row[1].strip(), row[2].strip(), row[3].strip(), row[4].strip()))
+            if deps_from_sheet:
+                with db.transaction() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM element_dependencies WHERE project_name=%s", [project_name])
+                        for w, e, r, p in deps_from_sheet:
+                            cur.execute(
+                                "INSERT INTO element_dependencies "
+                                "(project_name, waiting_sheet, element, requires_sheet, requires_position) "
+                                "VALUES (%s,%s,%s,%s,%s)",
+                                [project_name, w, e, r, p]
+                            )
+                from collections import Counter
+                pair_counts = Counter(f'{r}->{w}' for w, e, r, p in deps_from_sheet)
+                summary = ', '.join(f'{k}:{v}' for k, v in sorted(pair_counts.items()))
+                logger.info(f'  Зависимости ({project_name}): {len(deps_from_sheet)} записей [{summary}]')
+                return
+    except Exception as _ze:
+        if 'WorksheetNotFound' not in str(type(_ze)) and 'not found' not in str(_ze).lower():
+            logger.warning(f'  ЗАВИСИМОСТИ sheet error ({project_name}): {_ze}')
 
     def get_elems(sheet_name, col='ЭЛЕМЕНТ'):
         try:
             ws   = sheets._ws(file_id, sheet_name)
-            data = ws.get_all_values()
+            data = sheets._api_call(ws.get_all_values)
             if len(data) < 2:
                 return set()
             hdrs = data[1]
             idx  = next((i for i, h in enumerate(hdrs) if h.strip() == col), None)
+            if idx is None and col != "ЭЛЕМЕНТ":
+                idx = next((i for i, h in enumerate(hdrs) if h.strip() == "ЭЛЕМЕНТ"), None)
             if idx is None:
                 return set()
             return {r[idx].strip() for r in data[2:]
@@ -346,8 +376,9 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
             return set()
 
     pila      = get_elems('ПИЛА')
+    pila_pos  = get_elems('ПИЛА', 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА')  # все позиции ПИЛА включая простые профили
     plazma    = get_elems('ПЛАЗМА')
-    sverlenie = get_elems('СВЕРЛЕНИЕ')
+    sverlenie = get_elems('СВЕРЛЕНИЕ', 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА')
     sborka    = get_elems('СБОРКА')
     svarka    = get_elems('СВАРКА',    'ПОЗ. СОГЛАСНО ЧЕРТЕЖА')
     grunt     = get_elems('ГРУНТОВКА', 'Марка')
@@ -381,6 +412,10 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
     # ГРУНТОВКА <- СВАРКА, ПОКРАСКА <- ГРУНТОВКА
     for e in grunt & svarka:
         deps.append(('ГРУНТОВКА', e, 'СВАРКА', e))
+    # ГРУНТОВКА <- ПИЛА (простые профили: есть в ГРУНТОВКА и ПИЛА.ПОЗ, нет в СВАРКА)
+    for e in grunt - svarka:
+        if e in pila_pos:
+            deps.append(('ГРУНТОВКА', e, 'ПИЛА', e))
     for e in pokraska & grunt:
         deps.append(('ПОКРАСКА', e, 'ГРУНТОВКА', e))
 
@@ -488,6 +523,7 @@ def run(progress_cb=None):
                 rows = sheets.read_sheet(file_id, sheet_name)
                 _upsert_employees(rows, sheet_name)
                 pending_row_ids = []
+                seen_row_ids = []
                 synced = 0
                 for i, row in enumerate(rows):
                     r = _normalize_row(row, sheet_name, i+1, project_name, file_id, f['id'])
@@ -495,6 +531,7 @@ def run(progress_cb=None):
                         new_id = str(uuid.uuid4())
                         r['row_id'] = new_id
                         pending_row_ids.append((i+1, new_id))
+                    seen_row_ids.append(r['row_id'])
                     db.execute(UPSERT_SQL, r)
                     synced += 1
                 total_synced += synced
@@ -502,6 +539,24 @@ def run(progress_cb=None):
                 if pending_row_ids:
                     sheets.write_row_ids(file_id, sheet_name, pending_row_ids)
                     logger.info(f'  {sheet_name}: записано {len(pending_row_ids)} новых ROW_ID')
+
+                # Призраки: строки в БД которых больше нет в листе
+                # Защита: пропускаем если лист прочитан пустым
+                if seen_row_ids:
+                    ghost_del = db.fetchone(
+                        """
+                        WITH del AS (
+                            DELETE FROM work_orders
+                            WHERE project_name = %s AND sheet_name = %s
+                              AND row_id IS NOT NULL
+                              AND row_id::text <> ALL(%s)
+                            RETURNING 1
+                        ) SELECT COUNT(*) AS cnt FROM del
+                        """,
+                        [project_name, sheet_name, [str(r) for r in seen_row_ids]]
+                    )
+                    if ghost_del and ghost_del['cnt']:
+                        logger.info(f'  {sheet_name}: удалено {ghost_del["cnt"]} призраков')
 
                 try:
                     _apply_status_format_batch(file_id, sheet_name, rows)
@@ -634,6 +689,14 @@ def run(progress_cb=None):
             _rebuild_element_dependencies(f['project_name'], f['file_id'])
         except Exception as e:
             logger.error(f'  Зависимости rebuild error ({f["project_name"]}): {e}')
+
+    # Обновляем колонку БЛОК в листах после пересборки зависимостей
+    for f in files:
+        for sheet_name in ['СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']:
+            try:
+                _update_block_column(f['file_id'], sheet_name, f['project_name'])
+            except Exception as e:
+                logger.warning(f'  БЛОК update after deps ({f[project_name]}/{sheet_name}): {e}')
 
     # Reconcile: снимаем БЛОК с задач, чьи зависимости выполнены
     for f in files:
