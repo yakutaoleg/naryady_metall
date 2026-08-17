@@ -1,8 +1,8 @@
+.env
 __pycache__/
 *.pyc
-*.bak*
-venv/
-.env
+*.pyo
 logs/
 *.log
+.pytest_cache/
 service_account.json
