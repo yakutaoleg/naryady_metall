@@ -52,6 +52,31 @@ def apply_column_standards(file_id: str, sheet_name: str):
         }
     })
 
+
+    requests.append({
+        'updateSheetProperties': {
+            'properties': {'sheetId': sid, 'gridProperties': {'frozenRowCount': 2}},
+            'fields': 'gridProperties.frozenRowCount',
+        }
+    })
+
+    from src.sheet_standards import TABLE_BORDERS
+    _all_rows   = _api_call(ws.get_all_values)
+    _data_rows  = len(_all_rows)          # включая строку заголовка (строка 2)
+    _max_col    = max(cm.values())        # правая граница по реальным колонкам
+    requests.append({
+        'updateBorders': {
+            'range': {'sheetId': sid, 'startRowIndex': 1, 'endRowIndex': _data_rows,
+                      'startColumnIndex': 1, 'endColumnIndex': _max_col},
+            'top':             TABLE_BORDERS['top'],
+            'bottom':          TABLE_BORDERS['bottom'],
+            'left':            TABLE_BORDERS['left'],
+            'right':           TABLE_BORDERS['right'],
+            'innerHorizontal': TABLE_BORDERS['bottom'],
+            'innerVertical':   TABLE_BORDERS['right'],
+        }
+    })
+
     if requests:
         _api_call(_service().spreadsheets().batchUpdate(
             spreadsheetId=file_id, body={"requests": requests}).execute)
@@ -102,10 +127,14 @@ _hdr_cache = {}   # (file_id, sheet_name) → col_map dict
 
 def _api_call(fn, *args, **kwargs):
     """Retry on 429/503: 60s → 90s → 120s → 180s (per-minute quota windows)."""
+    import copy
     waits = [60, 90, 120, 180]
     for attempt in range(5):
         try:
-            return fn(*args, **kwargs)
+            # gspread batch_update мутирует ranges в переданном списке (добавляет 'Sheet'! prefix).
+            # При retry это приводит к двойному/тройному префиксу — передаём deepcopy.
+            _args = (copy.deepcopy(args[0]),) + args[1:] if args and getattr(fn, '__name__', '') == 'batch_update' else args
+            return fn(*_args, **kwargs)
         except APIError as e:
             if e.response.status_code in (429, 503) and attempt < 4:
                 wait = waits[min(attempt, len(waits) - 1)]
@@ -188,9 +217,30 @@ def find_active_files():
     return active
 
 
-def read_sheet(file_id: str, sheet_name: str) -> list[dict]:
-    ws = _ws(file_id, sheet_name)
-    rows = _api_call(ws.get_all_values)
+
+def read_all_sheets_batch(file_id: str, sheet_names: list) -> dict:
+    """Читает все листы одним API-вызовом (batchGet). Возвращает {sheet_name: raw_rows}."""
+    svc = _service()
+    request = svc.spreadsheets().values().batchGet(
+        spreadsheetId=file_id,
+        ranges=sheet_names,
+        valueRenderOption='FORMATTED_VALUE',
+    )
+    result = _api_call(request.execute)
+    out = {}
+    for vr in result.get('valueRanges', []):
+        rng  = vr.get('range', '')
+        name = rng.split('!')[0].strip("'")
+        out[name] = vr.get('values', [])
+    return out
+
+
+def read_sheet(file_id: str, sheet_name: str, preloaded: list = None) -> list[dict]:
+    if preloaded is not None:
+        rows = preloaded
+    else:
+        ws = _ws(file_id, sheet_name)
+        rows = _api_call(ws.get_all_values)
     if len(rows) < 2:
         return []
     headers = rows[1]
@@ -207,7 +257,7 @@ def read_sheet(file_id: str, sheet_name: str) -> list[dict]:
         el  = el.strip()
         if not pos and not el:
             continue
-        if pos == 'ИТОГО':
+        if pos == "ИТОГО" or any(v.strip() == "ИТОГО" for v in row):
             continue
         data.append(record)
     return data
@@ -342,7 +392,8 @@ _NEXT_SPEC = {
 
 
 def update_task_status(file_id: str, sheet_name: str, row_num: int,
-                       status: str, comment: str = None, date_fact: str = None, qty_done: int = None):
+                       status: str, comment: str = None, date_fact: str = None,
+                       qty_done: int = None, block_val=None):
     """Обновляет статус/комментарий/дату/выполнено одним батч-запросом."""
     cm = _col_map(file_id, sheet_name, rw=True)
     ws = _ws(file_id, sheet_name, rw=True)
@@ -359,11 +410,14 @@ def update_task_status(file_id: str, sheet_name: str, row_num: int,
     if qty_done is not None and cm.get('ВЫПОЛНЕНО'):
         updates.append({'range': f'{_col_letter(cm["ВЫПОЛНЕНО"])}{sheet_row}',  'values': [[qty_done]]})
 
-    # Колонка БЛОК: ⛔ NEXT_SPEC при статусе БЛОК, очищаем при ВЫПОЛНЕНО/ПЛАН/ЧАСТИЧНО
+    # Колонка БЛОК: можно передать block_val явно, иначе авто по NEXT_SPEC
     next_spec = _NEXT_SPEC.get(sheet_name.upper())
-    if cm.get('БЛОК') and next_spec:
-        blok_val = f'⛔ {next_spec}' if status == 'БЛОК' else ''
-        updates.append({'range': f'{_col_letter(cm["БЛОК"])}{sheet_row}', 'values': [[blok_val]]})
+    if cm.get('БЛОК') and (next_spec or block_val is not None):
+        if block_val is not None:
+            blok_to_write = block_val
+        else:
+            blok_to_write = f'⛔ {next_spec}' if status == 'БЛОК' else ''
+        updates.append({'range': f'{_col_letter(cm["БЛОК"])}{sheet_row}', 'values': [[blok_to_write]]})
 
     if updates:
         _api_call(ws.batch_update, updates)

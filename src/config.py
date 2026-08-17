@@ -14,6 +14,6 @@ DRIVE_FOLDER_ID = os.environ['DRIVE_FOLDER_ID']
 TEST_MODE       = os.environ.get('TEST_MODE', 'true').lower() == 'true'
 LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
 
-WORK_SHEETS = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА']
+WORK_SHEETS = ['ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ПОКРАСКА', 'ГРУНТОВКА']
 ACTIVE_FILE_NAME   = os.environ.get('ACTIVE_FILE_NAME', 'Наряды')
 INACTIVE_FILE_MARK = 'закрыт'

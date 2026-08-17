@@ -4,7 +4,7 @@ import os
 import io
 import re
 import asyncio
-from datetime import date
+from datetime import date, time as dtime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, BotCommand
@@ -50,6 +50,7 @@ WAITING_CORRECTION_QTY = 5
 WAITING_WIZARD_SPECS   = 6
 WAITING_WIZARD_CONFIRM = 7
 WAITING_WIZARD_SOURCES = 8
+WAITING_WIZARD_SECTIONS = 9
 TODAY = lambda: date.today().strftime('%d.%m.%Y')
 
 
@@ -95,59 +96,6 @@ def get_all_blocked():
     )
 
 
-def scan_folder_and_register(folder_id: str, created_by: int) -> dict:
-    """Сканирует папку Drive, находит таблицу и папку чертежей, сохраняет в projects.
-    Возвращает {'ok': True, 'project_name': ..., 'id': ...} или {'ok': False, 'error': ...}
-    """
-    # Проверка на дубликат
-    existing = db.fetchone("SELECT id, project_name FROM projects WHERE folder_id=%s", [folder_id])
-    if existing:
-        return {'ok': False, 'error': f"Проект «{existing['project_name']}» уже добавлен."}
-
-    creds = _SACredentials.from_service_account_file(
-        config.GOOGLE_SA_KEY,
-        scopes=['https://www.googleapis.com/auth/drive.readonly']
-    )
-    drive = _gdrive_build('drive', 'v3', credentials=creds)
-
-    # Ищем Google Sheets файл в папке
-    q_sheet = (
-        f"mimeType='application/vnd.google-apps.spreadsheet' "
-        f"and trashed=false and '{folder_id}' in parents"
-    )
-    sheets_res = drive.files().list(q=q_sheet, fields='files(id,name)', pageSize=10).execute()
-    sheets_found = sheets_res.get('files', [])
-    if not sheets_found:
-        return {'ok': False, 'error': 'В папке не найдена таблица Google Sheets.'}
-    if len(sheets_found) > 1:
-        return {'ok': False, 'error': f'В папке найдено несколько таблиц ({len(sheets_found)}). Оставьте одну.'}
-
-    sheet = sheets_found[0]
-    project_name = sheet['name']
-    sheet_id = sheet['id']
-
-    # Ищем папку чертежей (любая подпапка)
-    q_folder = (
-        f"mimeType='application/vnd.google-apps.folder' "
-        f"and trashed=false and '{folder_id}' in parents"
-    )
-    folders_res = drive.files().list(q=q_folder, fields='files(id,name)', pageSize=10).execute()
-    drawings_folder_id = None
-    for f in folders_res.get('files', []):
-        if 'черт' in f['name'].lower() or 'drawing' in f['name'].lower():
-            drawings_folder_id = f['id']
-            break
-    if not drawings_folder_id and folders_res.get('files'):
-        drawings_folder_id = folders_res['files'][0]['id']
-
-    db.execute(
-        """INSERT INTO projects (project_name, folder_id, sheet_id, drawings_folder_id, status, created_by)
-           VALUES (%s, %s, %s, %s, 'АКТИВНЫЙ', %s)""",
-        [project_name, folder_id, sheet_id, drawings_folder_id, created_by]
-    )
-    project = db.fetchone("SELECT id FROM projects WHERE folder_id=%s", [folder_id])
-    return {'ok': True, 'project_name': project_name, 'id': project['id']}
-
 
 def get_earnings_by_date(date_str: str):
     return db.fetchall(
@@ -184,40 +132,128 @@ def get_active_tasks(worker_name: str, specialization: str = None):
                   date_plan, priority, mandatory, status, drawing_link
            FROM work_orders
            WHERE executor=%s AND status IN ('ПЛАН','ЧАСТИЧНО')
-             AND (date_plan IS NULL OR date_plan <= CURRENT_DATE)
+             AND date_plan <= CURRENT_DATE
            ORDER BY mandatory DESC, sheet_name, priority ASC NULLS LAST, position""",
         [worker_name]
     )
     for t in tasks:
         if t['sheet_name'].upper() in SHEETS_WITH_DEPS:
-            t['deps_ready'] = _deps_ready(t['project_name'], t['element'])
+            try:
+                t['deps_ready'] = _deps_ready(t['project_name'], t['element'], t['sheet_name'])
+                if not t['deps_ready']:
+                    t['deps_avail_qty'], _ = _deps_available_qty(
+                        t['project_name'], t['element'], t['sheet_name'], int(t['quantity'] or 0)
+                    )
+                else:
+                    t['deps_avail_qty'] = int(t['quantity'] or 0)
+            except Exception as e:
+                app_logger.alert(f"_deps_ready error task_id={t['id']} element={t['element']}: {e}")
+                t['deps_ready'] = True
+                t['deps_avail_qty'] = int(t['quantity'] or 0)
         else:
             t['deps_ready'] = True
+            t['deps_avail_qty'] = int(t['quantity'] or 0)
     return tasks
 
 
-def _deps_ready(project_name: str, element: str) -> bool:
+def _deps_ready(project_name: str, element: str, sheet_name: str = None) -> bool:
     """Возвращает True если все зависимости для элемента выполнены (или зависимостей нет)."""
     if not element:
         return True
-    deps = db.fetchall(
-        """SELECT requires_sheet, requires_position FROM element_dependencies
-           WHERE project_name=%s AND element=%s""",
-        [project_name, element]
-    )
+    if sheet_name:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s AND waiting_sheet=%s""",
+            [project_name, element, sheet_name]
+        )
+    else:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s""",
+            [project_name, element]
+        )
     if not deps:
         return True
     for dep in deps:
         # Проверяем по element (не position): все строки с этим элементом в upstream листе
         rows = db.fetchall(
-            """SELECT status FROM work_orders
+            """SELECT status, COALESCE(quantity, 0) as qty FROM work_orders
                WHERE project_name=%s AND sheet_name=%s AND element=%s""",
             [project_name, dep['requires_sheet'], dep['requires_position']]
         )
         # Нет строк — upstream не заведён, считаем что не блокирует
-        if rows and any(r['status'] != 'ВЫПОЛНЕНО' for r in rows):
+        if not rows:
+            continue
+        # Проверяем по qty: все должны быть ВЫПОЛНЕНО
+        done_qty  = sum(int(r.get('qty') or 0) for r in rows if r['status'] == 'ВЫПОЛНЕНО')
+        total_qty = sum(int(r.get('qty') or 0) for r in rows)
+        if total_qty > 0 and done_qty < total_qty:
             return False
     return True
+
+
+def _deps_blocking(project_name: str, element: str, sheet_name: str = None) -> list[str]:
+    """Возвращает список незакрытых зависимостей в виде читаемых строк."""
+    if not element:
+        return []
+    if sheet_name:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s AND waiting_sheet=%s""",
+            [project_name, element, sheet_name]
+        )
+    else:
+        deps = db.fetchall(
+            """SELECT requires_sheet, requires_position FROM element_dependencies
+               WHERE project_name=%s AND element=%s""",
+            [project_name, element]
+        )
+    blocking = []
+    for dep in deps:
+        rows = db.fetchall(
+            """SELECT status, COALESCE(quantity, 0) as qty FROM work_orders
+               WHERE project_name=%s AND sheet_name=%s AND element=%s""",
+            [project_name, dep['requires_sheet'], dep['requires_position']]
+        )
+        if not rows:
+            continue
+        done_qty  = sum(int(r['qty']) for r in rows if r['status'] == 'ВЫПОЛНЕНО')
+        total_qty = sum(int(r['qty']) for r in rows)
+        if total_qty > 0 and done_qty < total_qty:
+            blocking.append(f"{dep['requires_sheet']}: {dep['requires_position']} ({done_qty}/{total_qty} шт вып.)")
+    return blocking
+
+
+def _deps_available_qty(project_name: str, element: str, sheet_name: str, task_qty: int) -> tuple:
+    """Возвращает (available_qty, task_qty) — сколько можно выполнить.
+    Пропорционально: upstream готов на 50% → доступно floor(0.5 * task_qty).
+    """
+    if not element or task_qty <= 0:
+        return (task_qty, task_qty)
+    deps = db.fetchall(
+        """SELECT requires_sheet, requires_position FROM element_dependencies
+           WHERE project_name=%s AND element=%s AND waiting_sheet=%s""",
+        [project_name, element, sheet_name]
+    )
+    if not deps:
+        return (task_qty, task_qty)
+    min_ratio = 1.0
+    for dep in deps:
+        rows = db.fetchall(
+            """SELECT status, COALESCE(quantity, 0) as qty FROM work_orders
+               WHERE project_name=%s AND sheet_name=%s AND element=%s""",
+            [project_name, dep['requires_sheet'], dep['requires_position']]
+        )
+        if not rows:
+            continue
+        done_qty  = sum(int(r['qty']) for r in rows if r['status'] == 'ВЫПОЛНЕНО')
+        total_qty = sum(int(r['qty']) for r in rows)
+        if total_qty > 0:
+            ratio = done_qty / total_qty
+            if ratio < min_ratio:
+                min_ratio = ratio
+    available = int(min_ratio * task_qty)
+    return (available, task_qty)
 
 
 async def _notify_worker_unblocked(bot, executor: str, position: str, element: str):
@@ -524,6 +560,7 @@ def main_menu_kb(role: str = ''):
             [InlineKeyboardButton("📅 Планы на сегодня", callback_data=f"plans:{date.today().isoformat()}")],
             [InlineKeyboardButton("🔧 Исправить выполнение", callback_data="correct:workers")],
             [InlineKeyboardButton("📊 Выработка", callback_data=f"earnings:{date.today().isoformat()}")],
+            [InlineKeyboardButton("🔍 Мониторинг", callback_data="run_monitor")],
             [InlineKeyboardButton("🔄 Обновить", callback_data="menu")],
         ]
     else:
@@ -566,7 +603,9 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
     multi_spec = len({t['sheet_name'] for t in tasks}) > 1
     for t in tasks:
         if not t.get('deps_ready', True):
-            prefix = "☐ "
+            _avail = t.get('deps_avail_qty', 0)
+            _tot   = int(t['quantity'] or 0)
+            prefix = f"✅ {_avail} из {_tot} " if _avail > 0 else "⛔ "
         elif t['mandatory']:
             prefix = "❗ "
         elif mandatory_left:
@@ -579,12 +618,14 @@ def tasks_list_kb(tasks: list, blocked: list, mandatory_left: list):
         else:
             qty_str = str(int(t['quantity'])) if t['quantity'] else '?'
         spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
-        label = f"{prefix}{spec_tag}{t['position']} — {t['element'] or ''} × {qty_str}"
+        pos_part = f"{t['position']} — " if t['position'] else ""
+        label = f"{prefix}{spec_tag}{pos_part}{t['element'] or ''} × {qty_str}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"task:{t['id']}")])
 
     for t in blocked:
         spec_tag = f"[{t['sheet_name']}] " if len({b['sheet_name'] for b in blocked}) > 1 else ""
-        label = f"⛔ {spec_tag}{t['position']} — {t['element'] or ''} (заблок.)"
+        pos_part2 = f"{t['position']} — " if t['position'] else ""
+        label = f"⛔ {spec_tag}{pos_part2}{t['element'] or ''} (заблок.)"
         buttons.append([InlineKeyboardButton(label, callback_data="blocked_info")])
 
     buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
@@ -657,7 +698,7 @@ def correct_tasks_kb(tasks: list, date_str: str):
         dfact = t['date_fact'].strftime('%d.%m') if t['date_fact'] else '—'
         qty = int(t['quantity'] or 0)
         rows.append([InlineKeyboardButton(
-            f"{icon} {t['position']} × {qty} шт ({dfact})",
+            f"{icon} {t['position'] or t['element'] or '—'} × {qty} шт ({dfact})",
             callback_data=f"correct:action:{t['id']}"
         )])
     rows.append(_correct_nav_row(date_str))
@@ -826,23 +867,28 @@ async def show_tasks(update: Update, worker_name: str, specialization: str = Non
         lines.append("❗ Обязательные:")
         for t in mandatory_tasks:
             spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
-            lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"  • {spec_tag}{pos_part}{t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if optional_tasks:
         lock = " 🔒 (после обязательных)" if mandatory_left else ""
         lines.append(f"\nОстальные{lock}:")
         for t in optional_tasks:
             spec_tag = f"[{t['sheet_name']}] " if multi_spec else ""
-            lines.append(f"  • {spec_tag}{t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"  • {spec_tag}{pos_part}{t['element'] or ''} × {t['quantity'] or '?'} шт")
 
     if blocked:
         lines.append("\n⛔ Заблокированные (снимает руководитель):")
         for t in blocked:
             comment = f" — {t['comment']}" if t['comment'] else ""
-            lines.append(f"  • {t['position']} — {t['element'] or ''}{comment}")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"  • {pos_part}{t['element'] or ''}{comment}")
 
     lines.append("\n👇 Нажмите на задачу:")
     tasks_text = "\n".join(lines)
+    if len(tasks_text) > 4000:
+        tasks_text = tasks_text[:3950] + "\n…(список обрезан)"
     tasks_kb   = tasks_list_kb(tasks, blocked, mandatory_left)
     if bot and chat_id:
         await bot.send_message(chat_id=chat_id, text=tasks_text, reply_markup=tasks_kb)
@@ -855,7 +901,8 @@ async def show_task_detail(update: Update, task: dict, specialization: str):
 
     lines = []
     mandatory_mark = "❗ " if task['mandatory'] else ""
-    lines.append(f"{mandatory_mark}[{task['sheet_name']}] {task['position']}")
+    _pos = task['position'] or task['element'] or ''
+    lines.append(f"{mandatory_mark}[{task['sheet_name']}] {_pos}")
     lines.append(f"Элемент: {task['element'] or '—'}")
     lines.append(f"Проект: {task['project_name']}")
     qty_done_val = task.get('qty_done') or 0
@@ -897,7 +944,8 @@ async def show_done_today(update: Update, worker_name: str, specialization: str)
         lines = [f"✅ Выполнено сегодня ({TODAY()}) — {len(tasks)} шт:\n"]
         for t in tasks:
             pay = f"  |  {t['payment_sum']} руб" if t['payment_sum'] else ""
-            lines.append(f"✅ {t['position']} — {t['element'] or ''} × {t['quantity'] or '?'} шт{pay}")
+            pos_part = f"{t['position']} — " if t['position'] else ""
+            lines.append(f"✅ {pos_part}{t['element'] or ''} × {t['quantity'] or '?'} шт{pay}")
         if total > 0:
             lines.append(f"\n💵 Итого за день: {total:.2f} руб")
         text = "\n".join(lines)
@@ -1010,11 +1058,11 @@ async def show_plans(update: Update, date_str: str = None, edit: bool = False, p
         rows = db.fetchall(
             """SELECT project_name, sheet_name, executor, position, element, quantity, status, date_plan,
                       payment_sum,
-                      (date_plan < CURRENT_DATE AND mandatory = true) AS overdue
+                      (date_plan < CURRENT_DATE) AS overdue
                FROM work_orders
                WHERE executor IS NOT NULL AND executor != ''
                  AND (date_plan = CURRENT_DATE
-                  OR (mandatory = true AND date_plan < CURRENT_DATE AND status = 'ПЛАН'))
+                  OR (date_plan < CURRENT_DATE AND status IN ('ПЛАН', 'ЧАСТИЧНО')))
                ORDER BY project_name, sheet_name, executor,
                         CASE status WHEN 'БЛОК' THEN 0 WHEN 'ПЛАН' THEN 1 WHEN 'ЧАСТИЧНО' THEN 2 ELSE 3 END,
                         date_plan, position""",
@@ -1076,7 +1124,9 @@ async def show_plans(update: Update, date_str: str = None, edit: bool = False, p
                         elem = f" ({t['element']})" if t['element'] else ""
                         sicon = STATUS_ICON.get(t['status'], '☐')
                         overdue_mark = f" (от {t['date_plan'].strftime('%d.%m')})" if t.get('overdue') else ""
-                        lines.append(f"      {sicon} {t['position']}{elem}{qty}{overdue_mark}")
+                        pos_label = t["position"] if t["position"] else (t["element"] or "—")
+                        elem_part = elem if t["position"] else ""
+                        lines.append(f"      {sicon} {pos_label}{elem_part}{qty}{overdue_mark}")
                         if t['status'] != 'БЛОК':
                             exec_total += float(t['payment_sum'] or 0)
                     if exec_total > 0:
@@ -1102,10 +1152,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except Exception:
-        # callback query expired (>48h) — notify user and stop
+        # callback query expired (>48h) — сообщаем пользователю и выходим
         try:
             await query.message.reply_text(
-                "⚠️ Кнопка устарела — откройте меню заново командой /start"
+                "⚠️ Вы нажали на кнопку из старого сообщения. "
+                "Пожалуйста, откройте меню заново — /start"
             )
         except Exception:
             pass
@@ -1136,6 +1187,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "noop":
         await query.answer()
         return
+
+    elif data == "run_monitor":
+        if not is_master(role):
+            await query.answer("Доступ только для мастера.", show_alert=True)
+            return
+        await query.answer("Запускаю мониторинг…")
+        await query.edit_message_text("⏳ Запускаю мониторинг листов…")
+        try:
+            import subprocess, sys as _sys
+            result = subprocess.run(
+                [_sys.executable, '/root/naryady/prod/tools/sheet_monitor.py'],
+                capture_output=True, text=True, timeout=300,
+                cwd='/root/naryady/prod'
+            )
+            output = (result.stdout or '').strip() or (result.stderr or '').strip() or 'Готово'
+            await query.edit_message_text(
+                '✅ Мониторинг завершён. ' + output[:200],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="menu")]])
+            )
+        except Exception as _me:
+            await query.edit_message_text(
+                '❌ Ошибка мониторинга: ' + str(_me)[:300],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="menu")]])
+            )
 
     elif data == "projects":
         if not is_master(role):
@@ -1239,23 +1314,65 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Проект не найден.", show_alert=True)
             return
         await query.answer("🔄 Запускаю синхронизацию...")
+
+        # Живое отображение прогресса
+        proj_name = project['project_name']
+        sheet_lines: list[str] = []
+        msg_text   = [f"🔄 Синхронизация: {proj_name}\n"]
+        loop = asyncio.get_event_loop()
+
+        def _build_text():
+            return "\n".join(msg_text + sheet_lines[-12:])
+
+        def _safe_edit(text):
+            async def _do():
+                try:
+                    await query.edit_message_text(text)
+                except Exception:
+                    pass
+            asyncio.run_coroutine_threadsafe(_do(), loop)
+
+        def progress_cb(phase, data):
+            if phase == 'project_start':
+                if data['project'] != proj_name:
+                    msg_text.append(f"\n📁 {data['project']}")
+                    sheet_lines.clear()
+            elif phase == 'sheet_done':
+                rows   = data['rows']
+                splits = data.get('splits', 0)
+                icon   = '✅' if rows > 0 else '➖'
+                line   = f"{icon} {data['sheet']}: {rows} стр."
+                if splits:
+                    line += f" (+{splits} сплит)"
+                sheet_lines.append(line)
+                done  = data['sheets_done']
+                total = data['total_sheets']
+                filled = int(done / total * 10)
+                bar = '▓' * filled + '░' * (10 - filled)
+                progress_line = f"[{bar}] {done}/{total}"
+                _safe_edit(_build_text() + f"\n⏳ {progress_line}")
+            elif phase == 'deps_done':
+                sheet_lines.append("\n🔗 Зависимости обновлены")
+                _safe_edit(_build_text())
+            elif phase == 'sync_done':
+                total = data['total']
+                final = _build_text() + f"\n\n✅ Готово! Обработано строк: {total}"
+                async def _finalize():
+                    try:
+                        await query.edit_message_text(
+                            final,
+                            reply_markup=project_detail_kb(project_id, 'АКТИВНЫЙ')
+                        )
+                    except Exception:
+                        pass
+                asyncio.run_coroutine_threadsafe(_finalize(), loop)
+
         try:
-            import subprocess, sys
-            subprocess.Popen(
-                [sys.executable, '-m', 'src.sync'],
-                cwd='/root/naryady/prod',
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            await query.edit_message_text(
-                f"🔄 Синхронизация запущена\n\n"
-                f"📁 {project['project_name']}\n\n"
-                f"Данные обновятся в течение минуты.",
-                reply_markup=project_detail_kb(project_id, 'АКТИВНЫЙ')
-            )
+            from src import sync as _sync
+            await loop.run_in_executor(None, _sync.run, progress_cb)
         except Exception as e:
             app_logger.alert(f"sync trigger error: {e}")
-            await query.answer("Ошибка запуска синхронизации.", show_alert=True)
+            await query.answer("Ошибка синхронизации.", show_alert=True)
 
     elif data.startswith("project:archive:"):
         if not is_master(role):
@@ -1283,10 +1400,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Проект «{project['project_name']}» восстановлен.")
         await show_projects(update, edit=True)
 
-    elif data == "master:blocks":
+    elif data.startswith("master:blocks"):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
             return
+        parts = data.split(":")
+        page = int(parts[2]) if len(parts) > 2 else 0
+        PAGE_SIZE = 10
         blocked = get_all_blocked()
         if not blocked:
             await query.edit_message_text(
@@ -1294,8 +1414,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=back_to_menu_kb()
             )
             return
-        lines = [f"🚫 Активные блоки — {len(blocked)} шт\n"]
-        for b in blocked:
+        total = len(blocked)
+        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        page = max(0, min(page, total_pages - 1))
+        chunk = blocked[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+        lines = [f"🚫 Активные блоки — {total} шт (стр. {page+1}/{total_pages})\n"]
+        for b in chunk:
             when = b['updated_at'].strftime('%d.%m %H:%M') if b['updated_at'] else '—'
             lines.append(
                 f"• [{b['sheet_name']}] {b['position']} — {b['element'] or '—'}\n"
@@ -1303,15 +1427,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  💬 {b['comment'] or '—'} | 🕐 {when}"
             )
         buttons = []
-        for b in blocked:
+        for b in chunk:
             label = f"✅ Снять: {b['position']} — {b['element'] or ''} ({b['sheet_name']})"
             buttons.append([InlineKeyboardButton(label, callback_data=f"unblock:{b['id']}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("← Пред", callback_data=f"master:blocks:{page-1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("След →", callback_data=f"master:blocks:{page+1}"))
+        if nav:
+            buttons.append(nav)
         buttons.append([InlineKeyboardButton("← Главное меню", callback_data="menu")])
         await query.edit_message_text(
             "\n\n".join(lines),
             reply_markup=InlineKeyboardMarkup(buttons)
         )
-
     elif data.startswith("earnings:"):
         if not is_master(role):
             await query.answer("Доступ только для мастера.", show_alert=True)
@@ -1347,10 +1477,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Задача не найдена.", reply_markup=back_to_tasks_kb())
             return
 
-        if task['sheet_name'].upper() in SHEETS_WITH_DEPS and not _deps_ready(task['project_name'], task['element']):
-            await query.answer(
-                f"☐ Ожидает готовности предыдущего этапа.",
-                show_alert=True
+        try:
+            _task_deps_ready = task['sheet_name'].upper() not in SHEETS_WITH_DEPS or _deps_ready(task['project_name'], task['element'], task['sheet_name'])
+            _task_blocking = [] if _task_deps_ready else _deps_blocking(task['project_name'], task['element'], task['sheet_name'])
+        except Exception as e:
+            app_logger.alert(f"_deps_ready/_deps_blocking error task_id={task_id}: {e}")
+            _task_deps_ready = True
+            _task_blocking = []
+        if not _task_deps_ready:
+            _tqty  = int(task['quantity'] or 0)
+            _avail, _ = _deps_available_qty(
+                task['project_name'], task['element'], task['sheet_name'], _tqty
+            )
+            if _avail > 0:
+                context.user_data['partial_deps_avail'] = _avail
+                lines = [
+                    f"✅ Задача частично доступна",
+                    f"Позиция: {task['position']} — {task['element'] or ''}",
+                    f"Готово деталей: {_avail} из {_tqty} шт",
+                    "",
+                    "Можно начать выполнение на доступное количество.",
+                ]
+                await query.answer()
+                await query.edit_message_text(
+                    "\n".join(lines),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"◧ Частично (макс {_avail} шт)",
+                                             callback_data=f"partial_ask:{task_id}")],
+                        [InlineKeyboardButton("← К задачам", callback_data="tasks")],
+                    ])
+                )
+                return
+            blocking = _task_blocking
+            lines = ["⏳ Задача ещё не доступна", f"Элемент: {task['element']}", "Ожидает выполнения:"]
+            for b in blocking:
+                lines.append(f"  ☐ {b}")
+            await query.answer()
+            await query.edit_message_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← К задачам", callback_data="tasks")]])
             )
             return
 
@@ -1370,7 +1535,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         app_logger.audit('view_task', user.id, user.username, {'task_id': task_id}, 'success')
-        await show_task_detail(update, task, specialization)
+        try:
+            await show_task_detail(update, task, specialization)
+        except Exception as e:
+            if 'Message is not modified' in str(e):
+                return  # безвредно — контент уже актуален
+            app_logger.alert(f"show_task_detail error task_id={task_id}: {e}")
+            await query.edit_message_text(
+                "⚠️ Не удалось открыть задачу. Администратор уведомлён.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← К задачам", callback_data="tasks")]])
+            )
 
     elif data.startswith("done:"):
         task_id = int(data.split(":")[1])
@@ -1383,6 +1557,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         today_str = date.today().strftime('%d.%m.%Y')
+
+        # Guard: если детали доступны только частично — запрещаем полное выполнение
+        if task.get('element') and task.get('sheet_name', '').upper() in SHEETS_WITH_DEPS:
+            _tqty_d = int(task['quantity'] or 0)
+            _avail_d, _ = _deps_available_qty(
+                task['project_name'], task['element'], task['sheet_name'], _tqty_d
+            )
+            if _avail_d < _tqty_d:
+                await query.answer(
+                    f"Доступно только {_avail_d} из {_tqty_d} шт. Используйте '◧ Частично'.",
+                    show_alert=True
+                )
+                return
 
         # 1. Обновляем PostgreSQL
         db.execute(
@@ -1440,12 +1627,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qty_total = int(task['quantity'] or 0)
         qty_done_already = int(task['qty_done'] or 0)
         remaining = qty_total - qty_done_already
+        deps_avail = context.user_data.pop('partial_deps_avail', None)
+        if deps_avail is None:
+            task_meta = db.fetchone(
+                "SELECT project_name, sheet_name FROM work_orders WHERE id=%s", [task_id]
+            )
+            if task_meta and task.get('element'):
+                deps_avail, _ = _deps_available_qty(
+                    task_meta['project_name'], task['element'], task_meta['sheet_name'], qty_total
+                )
+        max_allowed = min(remaining, deps_avail) if (deps_avail is not None and deps_avail < remaining) else remaining
         context.user_data['partial_task_id'] = task_id
+        context.user_data['partial_deps_avail'] = max_allowed
+        hint = (f"\n⚠️ Доступно: {max_allowed} шт (ждём остальные детали)\n"
+                if max_allowed < remaining else "\n")
         await query.edit_message_text(
             f"◧ Частичное выполнение\n\n"
             f"Позиция: {task['position']} — {task['element'] or ''}\n"
-            f"Всего: {qty_total} шт | Осталось: {remaining} шт\n\n"
-            f"Сколько выполнили? (от 1 до {remaining})"
+            f"Всего: {qty_total} шт | Осталось: {remaining} шт"
+            f"{hint}"
+            f"Сколько выполнили? (от 1 до {max_allowed})"
         )
         return WAITING_PARTIAL_QTY
 
@@ -1464,7 +1665,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes, _, mime = await asyncio.get_event_loop().run_in_executor(
                 None, _download_drawing, m.group(1)
             )
-            base_name = f"{task['position']} — {task['element'] or ''}"
             base_name = f"{task['position']} — {task['element'] or ''}"
             ext_map = {'image/png': 'png', 'image/jpeg': 'jpg', 'application/pdf': 'pdf'}
             ext = ext_map.get(mime, 'file')
@@ -1568,7 +1768,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Показываем обновлённый список блоков или меню если блоков больше нет
         remaining = get_all_blocked()
-        await query.answer("Блок снят.")
+        try:
+            await query.answer("Блок снят.")
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    "⚠️ Вы нажали на кнопку из старого сообщения. "
+                    "Блок уже был снят — откройте меню заново /start"
+                )
+            except Exception:
+                pass
         if remaining and is_master(role):
             lines = [f"🚫 Активные блоки — {len(remaining)} шт\n"]
             for b in remaining:
@@ -1872,10 +2081,19 @@ async def receive_partial_qty(update: Update, context: ContextTypes.DEFAULT_TYPE
     qty_done_before = int(task['qty_done'] or 0)
     qty_done_total = qty_done_before + qty_new
 
-    if qty_new <= 0 or qty_done_total > qty_total:
-        remaining = qty_total - qty_done_before
-        await update.message.reply_text(f"Некорректное число. Осталось: {remaining} шт.")
+    max_partial = context.user_data.pop('partial_deps_avail', None)
+    remaining = qty_total - qty_done_before
+    max_allowed = min(remaining, max_partial) if (max_partial is not None and max_partial < remaining) else remaining
+    if qty_new <= 0 or qty_done_total > qty_total or qty_new > max_allowed:
+        if qty_new > max_allowed and max_allowed < remaining:
+            await update.message.reply_text(
+                f"Нельзя выполнить {qty_new} шт — доступно только {max_allowed} шт.\n"
+                f"Введите число от 1 до {max_allowed}."
+            )
+        else:
+            await update.message.reply_text(f"Некорректное число. Осталось: {remaining} шт.")
         context.user_data['partial_task_id'] = task_id
+        context.user_data['partial_deps_avail'] = max_allowed
         return WAITING_PARTIAL_QTY
 
     today = TODAY()
@@ -2446,6 +2664,96 @@ wizard_sources_back = wizard_back
 
 
 async def wizard_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перехватчик: проверяет неизвестные секции перед созданием нарядов."""
+    query = update.callback_query
+    await query.answer()
+
+    source_map = context.user_data.get('wiz_source_map') or []
+    if not source_map:
+        source_map = _wiz.build_source_map(
+            context.user_data.get('wiz_active_specs', []),
+            context.user_data.get('wiz_recognized', []),
+        )
+        context.user_data['wiz_source_map'] = source_map
+
+    # Детектируем неизвестные секции (только если ещё не сделали)
+    if 'wiz_unknown_sections' not in context.user_data:
+        try:
+            unknown = _wiz.detect_unknown_sections(source_map)
+        except Exception as e:
+            app_logger.alert(f'wizard detect_unknown_sections error: {e}')
+            unknown = {}
+        context.user_data['wiz_unknown_sections'] = unknown
+        context.user_data['wiz_section_mapping'] = {}
+
+    unknown = context.user_data.get('wiz_unknown_sections', {})
+    # Если неизвестных нет → сразу к созданию
+    if not unknown:
+        return await _wizard_do_create(update, context)
+
+    await _wizard_show_sections(query.message, unknown, context.user_data.get('wiz_section_mapping', {}))
+    return WAITING_WIZARD_SECTIONS
+
+
+async def _wizard_show_sections(msg, unknown: dict, current_mapping: dict) -> None:
+    """Показывает экран маппинга неизвестных секций."""
+    lines = ['⚠️ *Найдены неизвестные типы сечений*',
+             'Укажи куда отнести каждое:']
+    kb_rows = []
+    for sec_val, positions in unknown.items():
+        pos_preview = ', '.join(positions[:3]) + ('…' if len(positions) > 3 else '')
+        mapped = current_mapping.get(sec_val, '')
+        mark_pila  = ' ✅' if mapped == 'ПИЛА'       else ''
+        mark_pla   = ' ✅' if mapped == 'ПЛАЗМА'     else ''
+        mark_skip  = ' ✅' if mapped == 'ПРОПУСТИТЬ' else ''
+        lines.append(f'`{sec_val}` (позиции: {pos_preview})')
+        safe = sec_val.replace(':', '_')
+        kb_rows.append([
+            InlineKeyboardButton(f'→ ПИЛА{mark_pila}',       callback_data=f'wiz_sec:ПИЛА:{safe}'),
+            InlineKeyboardButton(f'→ ПЛАЗМА{mark_pla}',      callback_data=f'wiz_sec:ПЛАЗМА:{safe}'),
+            InlineKeyboardButton(f'→ Пропустить{mark_skip}', callback_data=f'wiz_sec:ПРОПУСТИТЬ:{safe}'),
+        ])
+
+    all_mapped = all(sec in current_mapping for sec in unknown)
+    if all_mapped:
+        kb_rows.append([InlineKeyboardButton('🚀 Создать наряды', callback_data='wiz_sections_done')])
+    else:
+        lines.append('_Выбери для каждого сечения куда оно относится_')
+
+    kb_rows.append([InlineKeyboardButton('⬅️ Назад к источникам', callback_data='wiz_sources_back')])
+    await msg.edit_text('\n'.join(lines), parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup(kb_rows))
+
+
+async def wizard_section_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора маппинга для одного сечения."""
+    query = update.callback_query
+    await query.answer()
+    # callback_data = wiz_sec:<НАЗНАЧЕНИЕ>:<sec_val>
+    parts = query.data.split(':', 2)
+    if len(parts) < 3:
+        return WAITING_WIZARD_SECTIONS
+    _, destination, sec_safe = parts
+    unknown = context.user_data.get('wiz_unknown_sections', {})
+    # Найти оригинальный sec_val (с пробелами и т.п.)
+    sec_val = next((k for k in unknown if k.replace(':', '_') == sec_safe), sec_safe)
+    mapping = context.user_data.setdefault('wiz_section_mapping', {})
+    mapping[sec_val] = destination
+    await _wizard_show_sections(query.message, unknown, mapping)
+    return WAITING_WIZARD_SECTIONS
+
+
+async def wizard_sections_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Все секции выбраны → запускаем создание нарядов."""
+    return await _wizard_do_create(update, context)
+
+
+async def wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for _wizard_do_create (for handlers)."""
+    return await _wizard_do_create(update, context)
+
+
+async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Финальный шаг: создаём Google Sheet, вкладки, грузим данные, регистрируем в БД."""
     query = update.callback_query
     await query.answer()
@@ -2556,8 +2864,9 @@ async def wizard_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _upd(si, si)
     try:
         _ref_files = [item['file'] for item in context.user_data.get('wiz_recognized', [])
-                      if 'СПРАВОЧНИК' in item.get('specs', [])]
-        counts = _wiz.load_excel_data(sheet_id, source_map, reference_files=_ref_files)
+                      if any(s in item.get('specs', []) for s in ('СБОРКА', 'СПРАВОЧНИК'))]
+        _sec_mapping = context.user_data.get('wiz_section_mapping', {})
+        counts = _wiz.load_excel_data(sheet_id, source_map, reference_files=_ref_files, section_mapping=_sec_mapping)
     except Exception as e:
         app_logger.alert(f"wizard load_excel_data error: {e}")
         await query.message.edit_text(f"❌ Ошибка при загрузке данных:\n{e}")
@@ -2571,9 +2880,55 @@ async def wizard_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         app_logger.alert(f"wizard add_data_validations error: {e}")
 
-    # Нарезка PDF и привязка чертежей — отложено, см. ветку feature/pdf-naryad
-    cut_count  = 0
+    # Привязка чертежей по именам файлов (без PDF нарезки)
     link_count = 0
+    drawings_id = context.user_data.get('wiz_drawings_id')
+    if drawings_id:
+        try:
+            link_count = _wiz.link_drawings(sheet_id, drawings_id, active_specs)
+            app_logger.info(f"wizard link_drawings: {link_count} ссылок привязано")
+        except Exception as _le:
+            app_logger.alert(f"wizard link_drawings error: {_le}")
+    # ── Авто-генерация element_dependencies и запись в ЗАВИСИМОСТИ лист ────────
+    try:
+        from src import sync as _sync
+        from src.sheets import _gc as _gc_sh_pre, SCOPES_RW as _SCOPES_RW_pre
+        try:
+            _ss_pre = _gc_sh_pre(_SCOPES_RW_pre).open_by_key(sheet_id)
+            _ws_z_pre = _ss_pre.worksheet('ЗАВИСИМОСТИ')
+            _ws_z_pre.batch_clear(['A2:Z10000'])
+        except Exception as _ze_pre:
+            app_logger.alert(f'wizard: не удалось очистить ЗАВИСИМОСТИ перед rebuild: {_ze_pre}')
+        import time as _time_rb; _time_rb.sleep(65)  # ждём сброса read-квоты
+        _sync._rebuild_element_dependencies(project_name, sheet_id)
+        from src.db import get_conn as _gc_db
+        from src.sheets import _gc as _gc_sh, SCOPES_RW
+        with _gc_db() as _conn:
+            _cur = _conn.cursor()
+            _cur.execute(
+                "SELECT waiting_sheet, element, requires_sheet, requires_position "
+                "FROM element_dependencies WHERE project_name=%s ORDER BY waiting_sheet, element",
+                (project_name,)
+            )
+            _deps = _cur.fetchall()
+        if _deps:
+            _ss = _gc_sh(SCOPES_RW).open_by_key(sheet_id)
+            _ws_z = _ss.worksheet('ЗАВИСИМОСТИ')
+            _ws_z.clear()
+            _ws_z.update(
+                [['', 'КТО ЖДЁТ (специализация)', 'ЭЛЕМЕНТ (который ждёт)', 'ЗАВИСИТ ОТ (специализация)', 'ПОЗИЦИЯ (должна быть выполнена)', '']],
+                range_name='A1'
+            )
+            _ws_z.update([['', w, e, r, p, ''] for w, e, r, p in _deps], range_name='A2')
+            app_logger.info(f"wizard deps_sheet: {len(_deps)} records written")
+        for _spec in active_specs:
+            try:
+                _sync._update_block_column(sheet_id, _spec, project_name)
+            except Exception as _be:
+                app_logger.alert(f"wizard block_col {_spec}: {_be}")
+    except Exception as _de:
+        app_logger.alert(f"wizard rebuild_deps error: {_de}")
+
     # ── Последний шаг: активация (проект становится виден для sync) ────────────
     si = len(active_steps) - 1
     await _upd(si, si)
@@ -2584,6 +2939,17 @@ async def wizard_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(f"❌ Ошибка при активации проекта:\n{e}")
         return ConversationHandler.END
 
+
+    # Автосинхронизация в фоне (не блокируем визард)
+    async def _bg_sync():
+        try:
+            from src import sync as _sync
+            _loop = asyncio.get_event_loop()
+            await _loop.run_in_executor(None, _sync.run, None)
+            app_logger.info(f"wizard: bg sync завершён для нового проекта {project_id}")
+        except Exception as _se:
+            app_logger.alert(f"wizard post-create sync error: {_se}")
+    asyncio.ensure_future(_bg_sync())
     # Итоговое сообщение
     rows_txt = "\n".join(f"  • {spec}: {cnt} строк" for spec, cnt in counts.items()) if counts else "  (нет данных)"
     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
@@ -2640,6 +3006,33 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 
+async def _job_sync(context):
+    """Автосинхронизация каждые 15 минут."""
+    try:
+        from src import sync as _sync
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _sync.run, None)
+        app_logger.info("job_sync: завершён")
+    except Exception as e:
+        app_logger.alert(f"job_sync error: {e}")
+
+
+async def _job_cleanup_audit(context):
+    """Еженедельная очистка audit_log: sync_sheet > 14 дней, остальное > 90 дней."""
+    try:
+        deleted_tech = db.execute(
+            "DELETE FROM audit_log WHERE action='sync_sheet' AND ts < NOW() - INTERVAL '14 days'",
+            []
+        )
+        deleted_old = db.execute(
+            "DELETE FROM audit_log WHERE action!='sync_sheet' AND ts < NOW() - INTERVAL '90 days'",
+            []
+        )
+        app_logger.info(f"job_cleanup_audit: удалено {deleted_tech} tech + {deleted_old} user строк")
+    except Exception as e:
+        app_logger.alert(f"job_cleanup_audit error: {e}")
+
+
 def main():
     app = Application.builder().token(config.TG_TOKEN).build()
     app_logger.set_bot(app.bot)
@@ -2680,6 +3073,11 @@ def main():
                 CallbackQueryHandler(wizard_toggle_source, pattern=r'^wiz_src_toggle:'),
                 CallbackQueryHandler(wizard_sources_back,  pattern=r'^wiz_sources_back$'),
                 CallbackQueryHandler(wizard_create,        pattern=r'^wiz_create$'),
+            ],
+            WAITING_WIZARD_SECTIONS: [
+                CallbackQueryHandler(wizard_section_pick,   pattern=r'^wiz_sec:'),
+                CallbackQueryHandler(wizard_sections_done,  pattern=r'^wiz_sections_done$'),
+                CallbackQueryHandler(wizard_sources_back,   pattern=r'^wiz_sources_back$'),
             ],
         },
         fallbacks=[CommandHandler('cancel', cmd_cancel)],
@@ -2768,6 +3166,11 @@ def main():
         await app.bot.set_my_commands([
             BotCommand('start', 'Открыть меню'),
         ])
+        # Sync каждые 15 минут, первый запуск через 60 секунд после старта
+        app.job_queue.run_repeating(_job_sync, interval=900, first=60)
+        # Очистка audit_log каждое воскресенье в 03:00
+        app.job_queue.run_daily(_job_cleanup_audit, time=dtime(3, 0), days=(6,))
+        app_logger.info("JobQueue: sync(900s) + cleanup_audit(вс 03:00) зарегистрированы")
 
     app.post_init = post_init
     app_logger.info(f"Bot started. TEST_MODE={config.TEST_MODE}")
