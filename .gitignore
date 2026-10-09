@@ -6,3 +6,12 @@ logs/
 *.log
 .pytest_cache/
 service_account.json
+
+# Политика git (10.10.2026)
+backup/
+state/
+*.bak
+*.bak*
+*token*.json
+project_rules.json
+project_rules.json.bak

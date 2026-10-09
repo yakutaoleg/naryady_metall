@@ -1,63 +1,48 @@
-# Git Workflow — Наряды Цех Металла
+# Git — правила работы (Наряды, Цех Металла)
 
-## Ветки
+Принято 10.10.2026. Заменяет прежнюю схему test → prod с PR: тестового стенда больше нет.
 
-| Ветка | Окружение | БД | Бот |
-|---|---|---|---|
-| develop | /root/naryady/test/ | naryady_test | Тест-бот |
-| main | /root/naryady/prod/ | naryady | Прод-бот |
+## Источник истины
 
-Прямые коммиты в main — запрещены.
-Всё идёт через develop → PR → main.
+- Код бота живёт в репозитории на VPS: `/root/naryady/prod`, ветка **`develop`**. Это то, что работает в проде.
+- Remote `origin` = `github.com/yakutaoleg/naryady_metall`. Ветка `main` там — **замороженный архив** старой истории (у неё нет общего предка с `develop`). В `main` не пишем, PR в неё не открываем.
+- Папка `Automatization/Metall/src` на Windows — архивная копия. Не править. Изменения делаются только на VPS патчами через scp.
+- Репозиторий `C:\Users\MSI\Projects` на Windows не связан с GitHub-репозиторием бота (remote `metall` удалён).
 
----
+## Цикл изменения
 
-## Цикл разработки
+1. Сделать патч (scp + python-скрипт), перед правкой сохранить бэкап файла.
+2. `cd /root/naryady/prod && /root/naryady/test/venv/bin/python -m pytest tests -q` — все тесты зелёные.
+3. Перезапуск сервиса, проверка: `systemctl is-active naryady-bot-prod` = `active`, в логах нет ошибок.
+4. Коммит и `git push origin develop` **в тот же день**. Рабочие изменения без коммита дольше суток не держим.
+5. После выкатывания, меняющего поведение бота или синка, поставить тег `prod-ГГГГ-ММ-ДД` и запушить его: `git tag prod-2026-10-10 && git push origin prod-2026-10-10`.
 
-1. Claude пишет код в develop на VPS
-2. Запускает pytest сам через SSH  
-3. Если тесты зелёные → коммит → push в develop
-4. Олег смотрит результат в тест-боте
-5. Approve → PR develop → main → деплой в prod
+## Коммиты
 
----
+- Формат: `feat | fix | test | docs | chore | refactor: описание`, по-русски. Один коммит — одно логическое изменение.
+- Документацию (`docs/project_status.md`, `CHANGELOG.md`) обновляем в том же коммите.
+- **Не коммитим:** секреты (`*token*.json`, `service_account.json`, `.env`), `state/`, `logs/`, `backup/`, `*.bak*`, `project_rules.json`.
 
-## Формат коммитов
+## Откат
 
-feat: добавить команду /план в бот
-fix: исправить парсинг даты из Sheets
-test: добавить тест синка для пустых строк
-chore: обновить requirements.txt
-docs: обновить GIT_WORKFLOW.md
-refactor: вынести логику логгера в отдельный класс
+Через git, а не через файлы `.bak`:
 
----
-
-## Деплой в prod (после approve Олега)
-
-cd /root/naryady/prod
-git pull origin main
-pip install -r requirements.txt -q
-systemctl restart naryady-bot
-systemctl restart naryady-sync
-
----
-
-## Откат в случае проблем
-
-# Посмотреть историю
+```bash
 git log --oneline -10
+git checkout <тег-или-коммит> -- src/файл.py
+systemctl restart naryady-bot-prod
+```
 
-# Откатить prod к предыдущему коммиту
-git checkout <commit-hash>
-systemctl restart naryady-bot
+или `git revert <коммит>`. Старые файлы `.bak*` в `src/` не копим: после коммита бэкап не нужен.
 
----
+## Токены GitHub
 
-## Правила
+- Fine-grained токен, только на репозиторий `naryady_metall`, права: Contents и Pull requests — Read and write.
+- Срок 90 дней. Хранится только в `mcp.json`, не в чате и не в git.
+- Продлить за 7 дней до окончания срока.
 
-- Файлы .env никогда не коммитятся (есть в .gitignore)
-- Файл service_account.json никогда не коммитится
-- Каждая фича — отдельный коммит с понятным сообщением
-- Перед PR — все тесты должны быть зелёными
-- Версии фиксируются в CHANGELOG.md
+## Пульс и проверки (для справки)
+
+- Ночная проверка данных: 07:30, `src/consistency_check.py`.
+- Пульс: каждые 10 минут, `src/heartbeat.py`.
+- Unit-файлы лежат в `deploy/systemd/`; после изменения в `/etc/systemd/system/` копируем их сюда.
