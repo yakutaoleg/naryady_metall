@@ -1,0 +1,10 @@
+[Unit]
+Description=Naryady consistency check daily at 07:30 MSK (PROD)
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+Unit=naryady-check-prod.service
+
+[Install]
+WantedBy=timers.target

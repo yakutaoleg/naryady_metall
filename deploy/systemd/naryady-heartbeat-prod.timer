@@ -1,0 +1,10 @@
+[Unit]
+Description=Naryady heartbeat every 10 min (PROD)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=naryady-heartbeat-prod.service
+
+[Install]
+WantedBy=timers.target

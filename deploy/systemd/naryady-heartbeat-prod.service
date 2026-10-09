@@ -1,0 +1,11 @@
+[Unit]
+Description=Naryady heartbeat (PROD)
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/naryady/prod
+ExecStart=/root/naryady/test/venv/bin/python src/heartbeat.py
+TimeoutStartSec=120
+StandardOutput=append:/root/naryady/prod/logs/heartbeat.log
+StandardError=append:/root/naryady/prod/logs/heartbeat.log

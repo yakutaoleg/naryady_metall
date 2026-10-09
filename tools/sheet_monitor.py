@@ -170,10 +170,14 @@ def short_ref(issue_text):
     return issue_text[:40]
 
 
-def check_sheet(sheet_name, cfg, file_id=None, project_name=""):
+def check_sheet(sheet_name, cfg, file_id=None, project_name="", ss=None):
     issues = []
-    gc = sh._gc()
-    ss = gc.open_by_key(file_id or FILE_ID)
+    if ss is None:
+        gc = sh._gc()
+        print(f'[MONITOR] {_ts()}   open_by_key({sheet_name})...', flush=True)
+        ss = gc.open_by_key(file_id or FILE_ID)
+    else:
+        print(f'[MONITOR] {_ts()}   spreadsheets.get({sheet_name})...', flush=True)
 
     for _attempt in range(5):
         try:
@@ -186,10 +190,10 @@ def check_sheet(sheet_name, cfg, file_id=None, project_name=""):
         except Exception as _e:
             if '429' in str(_e) and _attempt < 4:
                 wait = 60 + _attempt * 30
-                print(f'[MONITOR] 429 на {sheet_name} (попытка {_attempt+1}/5), жду {wait}s', flush=True)
+                print(f'[MONITOR] {_ts()}   429 на {sheet_name} (попытка {_attempt+1}/5), жду {wait}s', flush=True)
                 time.sleep(wait)
             else:
-                print(f'[MONITOR] Ошибка на {sheet_name}: {_e}', flush=True)
+                print(f'[MONITOR] {_ts()}   Ошибка на {sheet_name}: {_e}', flush=True)
                 raise
     sheet_data = next(x for x in resp['sheets'] if x['properties']['title'] == sheet_name)
     col_meta  = sheet_data['data'][0].get('columnMetadata', [])
@@ -379,12 +383,13 @@ def check_sheet(sheet_name, cfg, file_id=None, project_name=""):
     return issues
 
 
-def check_sotrudniki_formulas(project_name: str, file_id: str) -> list:
+def check_sotrudniki_formulas(project_name: str, file_id: str, ss=None) -> list:
     """Проверяет что в листе СОТРУДНИКИ правая таблица (G4:M4) содержит формулы, а не hardcoded данные."""
     issues = []
     try:
-        gc = sh._gc()
-        ss = gc.open_by_key(file_id)
+        if ss is None:
+            gc = sh._gc()
+            ss = gc.open_by_key(file_id)
         sheet_titles = [ws.title for ws in ss.worksheets()]
         if 'СОТРУДНИКИ' not in sheet_titles:
             return []  # листа нет — это другая проверка
@@ -464,12 +469,20 @@ def check_deps_health(project_name: str) -> list:
             [project_name]
         )
         cnt = row['cnt'] if row else 0
+        wo_row = db.fetchone(
+            "SELECT COUNT(*) as wc FROM work_orders WHERE project_id IN "
+            "(SELECT id FROM projects WHERE project_name=%s)",
+            [project_name]
+        )
+        wo_cnt = wo_row['wc'] if wo_row else 0
+        # Порог: 15% от числа нарядов, но не меньше 5
+        dyn_threshold = max(5, int(wo_cnt * 0.15))
         if cnt == 0:
             issues.append('ЗАВИСИМОСТИ_ЗДОРОВЬЕ | ' + project_name + ': 0 записей — автогенерация не сработала')
-        elif cnt < DEPS_MIN_THRESHOLD:
+        elif cnt < dyn_threshold:
             issues.append(
                 'ЗАВИСИМОСТИ_ЗДОРОВЬЕ | ' + project_name +
-                ': только ' + str(cnt) + ' записей (ожидается >=' + str(DEPS_MIN_THRESHOLD) + ') — возможен сбой матчинга'
+                ': только ' + str(cnt) + ' записей (ожидается >=' + str(dyn_threshold) + ' при ' + str(wo_cnt) + ' нарядах) — возможен сбой матчинга'
             )
     except Exception as e:
         issues.append('ЗАВИСИМОСТИ_ЗДОРОВЬЕ | Ошибка проверки: ' + str(e))
@@ -521,20 +534,79 @@ def format_alert(all_issues, new_fps, seen_fps, project_name=""):
     return chr(10).join(lines)
 
 
+def _ts():
+    from datetime import datetime as _dt
+    return _dt.now().strftime('%H:%M:%S')
+
 def run_for_project(proj_name, file_id):
     """Проверяет один проект, возвращает список нарушений."""
     issues = []
-    for sheet_name, cfg in SHEETS_CONFIG.items():
+
+    # Открываем spreadsheet один раз на весь проект — экономим API-запросы
+    print(f'[MONITOR] {_ts()} [{proj_name}] open_by_key...', flush=True)
+    ss = None
+    for _obk_attempt in range(5):
         try:
-            issues.extend(check_sheet(sheet_name, cfg, file_id=file_id, project_name=proj_name))
+            gc = sh._gc()
+            ss = gc.open_by_key(file_id)
+            print(f'[MONITOR] {_ts()} [{proj_name}] открыт ✓', flush=True)
+            break
         except Exception as e:
+            if '429' in str(e) and _obk_attempt < 4:
+                _wait = 60 + _obk_attempt * 30
+                print(f'[MONITOR] {_ts()} [{proj_name}] open_by_key 429 (попытка {_obk_attempt+1}/5), жду {_wait}s...', flush=True)
+                time.sleep(_wait)
+            else:
+                print(f'[MONITOR] {_ts()} [{proj_name}] open_by_key ОШИБКА: {e}', flush=True)
+                issues.append('ПРОЧЕЕ | [' + proj_name + '] open_by_key: ошибка — ' + str(e))
+                return issues
+    if ss is None:
+        issues.append('ПРОЧЕЕ | [' + proj_name + '] open_by_key: все попытки исчерпаны')
+        return issues
+
+    sheet_names = list(SHEETS_CONFIG.items())
+    n = len(sheet_names)
+    for i, (sheet_name, cfg) in enumerate(sheet_names):
+        print(f'[MONITOR] {_ts()} [{proj_name}] {sheet_name} ({i+1}/{n})...', flush=True)
+        t0 = time.time()
+        try:
+            found = check_sheet(sheet_name, cfg, file_id=file_id, project_name=proj_name, ss=ss)
+            issues.extend(found)
+            print(f'[MONITOR] {_ts()} [{proj_name}] {sheet_name} — {len(found)} нарушений за {time.time()-t0:.1f}s', flush=True)
+        except Exception as e:
+            print(f'[MONITOR] {_ts()} [{proj_name}] {sheet_name} — ОШИБКА: {e}', flush=True)
             issues.append('ПРОЧЕЕ | [' + proj_name + '] ' + sheet_name + ': ошибка — ' + str(e))
+        if i < len(sheet_names) - 1:
+            print(f'[MONITOR] {_ts()} [{proj_name}] пауза 3s...', flush=True)
+            time.sleep(3)
+
+    print(f'[MONITOR] {_ts()} [{proj_name}] check_sotrudniki_formulas...', flush=True)
     try:
-        issues.extend(check_sotrudniki_formulas(proj_name, file_id))
-        issues.extend(check_dep_hangups(proj_name))
-        issues.extend(check_deps_health(proj_name))
+        found = check_sotrudniki_formulas(proj_name, file_id, ss=ss)
+        issues.extend(found)
+        print(f'[MONITOR] {_ts()} [{proj_name}] СОТРУДНИКИ — {len(found)} нарушений', flush=True)
     except Exception as e:
+        print(f'[MONITOR] {_ts()} [{proj_name}] СОТРУДНИКИ — ОШИБКА: {e}', flush=True)
+        issues.append('ПРОЧЕЕ | [' + proj_name + '] СОТРУДНИКИ: ошибка — ' + str(e))
+
+    print(f'[MONITOR] {_ts()} [{proj_name}] check_dep_hangups...', flush=True)
+    try:
+        found = check_dep_hangups(proj_name)
+        issues.extend(found)
+        print(f'[MONITOR] {_ts()} [{proj_name}] dep_hangups — {len(found)} нарушений', flush=True)
+    except Exception as e:
+        print(f'[MONITOR] {_ts()} [{proj_name}] dep_hangups — ОШИБКА: {e}', flush=True)
         issues.append('ПРОЧЕЕ | [' + proj_name + '] зависания: ошибка — ' + str(e))
+
+    print(f'[MONITOR] {_ts()} [{proj_name}] check_deps_health...', flush=True)
+    try:
+        found = check_deps_health(proj_name)
+        issues.extend(found)
+        print(f'[MONITOR] {_ts()} [{proj_name}] deps_health — {len(found)} нарушений', flush=True)
+    except Exception as e:
+        print(f'[MONITOR] {_ts()} [{proj_name}] deps_health — ОШИБКА: {e}', flush=True)
+        issues.append('ПРОЧЕЕ | [' + proj_name + '] зависимости: ошибка — ' + str(e))
+
     return issues
 
 
@@ -629,12 +701,15 @@ def main():
 
     all_issues_by_proj = {}
     all_flat = []
-    for proj in projects:
+    for proj_idx, proj in enumerate(projects):
         proj_name = proj["project_name"]
         file_id   = proj["sheet_id"]
         issues = run_for_project(proj_name, file_id)
         all_issues_by_proj[proj_name] = issues
         all_flat.extend(issues)
+        if proj_idx < len(projects) - 1:
+            print(f'[MONITOR] Пауза 20s перед следующим проектом...', flush=True)
+            time.sleep(40)
 
     if not all_flat:
         save_state(set())

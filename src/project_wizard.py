@@ -19,6 +19,7 @@ import uuid
 from typing import Optional
 import functools
 from gspread.exceptions import APIError as _GspreadAPIError
+from src import sheets
 
 def _w(fn, *args, max_retries=3, **kwargs):
     """Вызывает fn(*args, **kwargs), при 429 ждёт 65s и повторяет (до max_retries раз)."""
@@ -29,6 +30,21 @@ def _w(fn, *args, max_retries=3, **kwargs):
             if '429' in str(e) and attempt < max_retries:
                 wait = 65 + attempt * 30
                 log.warning(f'Sheets 429 (попытка {attempt+1}/{max_retries}), жду {wait}s...')
+                time.sleep(wait)
+            else:
+                raise
+
+
+def _wexec(request, max_retries=3):
+    """Retry на 429/403 для googleapiclient .execute() (batchUpdate и др.)."""
+    from googleapiclient.errors import HttpError
+    for attempt in range(max_retries + 1):
+        try:
+            return request.execute()
+        except HttpError as e:
+            if e.resp.status in (429, 403) and attempt < max_retries:
+                wait = 65 + attempt * 30
+                log.warning(f'Sheets API {e.resp.status} (попытка {attempt+1}/{max_retries}), жду {wait}s...')
                 time.sleep(wait)
             else:
                 raise
@@ -364,6 +380,10 @@ def recognize_excel(file_id: str, filename: str, mime: str = '') -> list[str]:
                     )
                     if _holes_has_val and 'СВЕРЛЕНИЕ' not in result_specs:
                         result_specs = result_specs + ['СВЕРЛЕНИЕ']
+            # Файл с «сверл» в имени — специализированный файл отверстий.
+            # Профили там описывают что сверлить, не самостоятельные позиции ПИЛА/ПЛАЗМА.
+            if 'сверл' in fname_lower and 'СВЕРЛЕНИЕ' in result_specs:
+                result_specs = ['СВЕРЛЕНИЕ']
             return result_specs
 
     # Смешанные КМД «элементы»: если есть и пластины (ПЛАЗМА) и профили (ПИЛА) — вернуть оба
@@ -384,6 +404,27 @@ def recognize_excel(file_id: str, filename: str, mime: str = '') -> list[str]:
             ):
                 _mix_specs.append('СВЕРЛЕНИЕ')
         return _mix_specs
+
+    # Content-based fallback (filename-rules не дали результат -> по содержимому)
+    # 1) Есть grouper-строки -> файл Сборок
+    import re as _re_grp_det
+    _content_has_grouper = any(
+        row[0] is not None and (
+            str(row[0]).strip().lower().startswith('поз.=') or
+            _re_grp_det.search(r'(?i)количество\s*=\s*\d', str(row[0]).strip())
+        )
+        for row in rows[1:] if row and len(row) > 0
+    )
+    if _content_has_grouper:
+        return ['СБОРКА', 'СВАРКА', 'ПЛАЗМА', 'ПИЛА']
+
+    # 2) Нет Сечение, нет grouper, есть Марка+Количество+Масса -> Отправочные
+    _c_has_sec  = any('сечени' in h.lower() for h in header_row)
+    _c_has_mark = any(h.lower() in ('марка', 'элемент') for h in header_row)
+    _c_has_kvo  = any('количеств' in h.lower() or h.lower() == 'кол-во' for h in header_row)
+    _c_has_mass = any('масса' in h.lower() for h in header_row)
+    if not _content_has_grouper and not _c_has_sec and _c_has_mark and _c_has_kvo and _c_has_mass:
+        return ['ГРУНТОВКА', 'ПОКРАСКА']
 
     return []
 
@@ -608,7 +649,9 @@ def detect_unknown_sections(source_map: list) -> dict:
                 if pos_val and pos_val not in unknown[sec_val]:
                     unknown[sec_val].append(pos_val)
 
-    return {k: v[:5] for k, v in unknown.items()}
+    # Фильтруем секции уже известные из project_rules.json
+    _known = set(_rules().get('section_mapping', {}).keys())
+    return {k: v[:5] for k, v in unknown.items() if k not in _known}
 
 def create_spreadsheet(project_name: str, folder_id: str) -> str:
     """
@@ -662,13 +705,13 @@ def setup_sheet_tabs(sheet_id: str, active_specs: list[str]) -> None:
     active_ordered = [s for s in ALL_SPECS if s in active_specs]
 
     gc = _gc(SCOPES_RW)
-    ss = gc.open_by_key(sheet_id)
+    ss = _w(gc.open_by_key, sheet_id)
 
-    existing_titles = {ws.title for ws in ss.worksheets()}
+    existing_titles = {ws.title for ws in _w(ss.worksheets)}
     default_sheet = None
     if 'Sheet1' in existing_titles or 'Лист1' in existing_titles:
         title = 'Sheet1' if 'Sheet1' in existing_titles else 'Лист1'
-        default_sheet = ss.worksheet(title)
+        default_sheet = _w(ss.worksheet, title)
 
     created_sheets = []
     for spec in active_ordered:
@@ -676,7 +719,7 @@ def setup_sheet_tabs(sheet_id: str, active_specs: list[str]) -> None:
             log.warning(f'setup_sheet_tabs: нет колонок для {spec}')
             continue
         cols = col_defs[spec]
-        ws = ss.add_worksheet(title=spec, rows=1000, cols=len(cols))
+        ws = _w(ss.add_worksheet, title=spec, rows=1000, cols=len(cols))
         created_sheets.append((ws, cols))
         _w(ws.update, [[spec]], range_name='B1')
         _w(ws.update, [cols],   range_name='A2')
@@ -684,7 +727,7 @@ def setup_sheet_tabs(sheet_id: str, active_specs: list[str]) -> None:
 
     if default_sheet and created_sheets:
         time.sleep(2)
-        ss.del_worksheet(default_sheet)
+        _w(ss.del_worksheet, default_sheet)
 
     time.sleep(3)
     service  = _sheets_service()
@@ -757,9 +800,9 @@ def setup_sheet_tabs(sheet_id: str, active_specs: list[str]) -> None:
             # Дропдауны СТАТУС/ОБЯЗАТЕЛЬНАЯ/ИСПОЛНИТЕЛЬ добавляются позже (add_data_validations)
 
     if requests:
-        service.spreadsheets().batchUpdate(
+        _wexec(service.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={'requests': requests}
-        ).execute()
+        ))
 
 
 def setup_service_tabs(sheet_id: str, active_specs: list[str]) -> None:
@@ -935,9 +978,9 @@ def setup_service_tabs(sheet_id: str, active_specs: list[str]) -> None:
     # Применяем всё форматирование одним батчем
     time.sleep(8)
     if requests:
-        svc.spreadsheets().batchUpdate(
+        _wexec(svc.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={'requests': requests}
-        ).execute()
+        ))
 
 
 def _sheets_service():
@@ -1009,9 +1052,9 @@ def _add_itogo_rows(sheet_id: str, tasks: list[dict]) -> None:
             }})
 
     if requests:
-        service.spreadsheets().batchUpdate(
+        _wexec(service.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={'requests': requests}
-        ).execute()
+        ))
 
 
 def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list = None, section_mapping: dict = None) -> dict:
@@ -1042,10 +1085,12 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
 
         hdr_idx = 0
         for i, row in enumerate(rows[:5]):
-            if any(c is not None and str(c).strip() for c in row):
+            # Пропускаем строки-титулы (1 заполненная ячейка) — ищем настоящий заголовок
+            _non_empty0 = sum(1 for c in row if c is not None and str(c).strip())
+            if _non_empty0 >= 2:
                 hdr_idx = i
                 break
-        r1 = rows[hdr_idx]
+        r1 = list(rows[hdr_idx])
         r2 = rows[hdr_idx + 1] if hdr_idx + 1 < len(rows) else []
 
         # Определяем: r2 — продолжение заголовков (2-строчный шапки) или уже данные?
@@ -1058,6 +1103,21 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
         )
 
         if not _r2_is_data and r2:
+            # Forward-fill r1: merged-cell заголовок (напр. "Масса" на F:H) в openpyxl
+            # виден только в первой ячейке диапазона. Растягиваем на соседние ТОЛЬКО
+            # там, где у строки-подзаголовка (r2) реально есть значение —
+            # иначе не трогаем (не плодим ложные заголовки в случайно пустых хвостах).
+            _ff_last = ''
+            for _fi in range(max(len(r1), len(r2))):
+                _v1 = str(r1[_fi]).strip() if _fi < len(r1) and r1[_fi] is not None else ''
+                _v2 = str(r2[_fi]).strip() if _fi < len(r2) and r2[_fi] is not None else ''
+                if _v1:
+                    _ff_last = _v1
+                elif _v2 and _ff_last:
+                    if _fi < len(r1):
+                        r1[_fi] = _ff_last
+                    else:
+                        r1.append(_ff_last)
             # Проверяем нужна ли 3-я строка заголовка
             r3 = rows[hdr_idx + 2] if hdr_idx + 2 < len(rows) else []
             _r3_is_data = any(
@@ -1065,11 +1125,11 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 and _re_num_hdr.match(r'^-?\d+([.,]\d+)?$', str(c).strip())
                 for c in r3
             )
-            # r3 — продолжение заголовка если: не числа И хотя бы r1/r2 имеют None в той же колонке
+            # r3 — продолжение заголовка если: не числа И хотя бы r2 имеет None в той же колонке
+            # (r1 может содержать первую часть составного заголовка: "Кол-во" / "отверстий")
             _r3_is_hdr = (not _r3_is_data and r3 and
                 any(c is not None and str(c).strip() for c in r3) and
                 any(
-                    (ci >= len(r1) or r1[ci] is None or str(r1[ci]).strip() == '') and
                     (ci >= len(r2) or r2[ci] is None or str(r2[ci]).strip() == '')
                     for ci, c in enumerate(r3)
                     if c is not None and str(c).strip()
@@ -1097,7 +1157,24 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
             if not xh or xh.startswith('_'):
                 continue
             mapped = col_mapping.get(xh)
-            if xh in col_mapping and mapped is None:
+            _skip_col = (xh in col_mapping and mapped is None)
+            if mapped is None and not _skip_col:
+                _xh_l = xh.lower()
+                for _ck, _cv in col_mapping.items():
+                    if _ck.lower() == _xh_l:
+                        mapped = _cv
+                        _skip_col = (_cv is None)
+                        break
+            if mapped is None and not _skip_col:
+                # Перенос строки внутри ячейки Excel читается как пробел посреди слова
+                # ("Коли чество" вместо "Количество") — сравниваем без пробелов вообще.
+                _xh_nospace = xh.lower().replace(' ', '').replace('\n', '').replace('\t', '')
+                for _ck, _cv in col_mapping.items():
+                    if _ck.lower().replace(' ', '') == _xh_nospace:
+                        mapped = _cv
+                        _skip_col = (_cv is None)
+                        break
+            if _skip_col:
                 continue
             xl_to_sheet[xi] = mapped if mapped else xh
 
@@ -1110,9 +1187,47 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
 
     # Строки для СВЕРЛЕНИЕ, собранные из ПИЛА/ПЛАЗМА по колонке КОЛ-ВО ОТВЕРСТИЙ
     _sverlenie_pending: list = []
-    # Простые профили из отправочных файлов (без подэлементов) -> в ПИЛА
-    _pila_from_otpr: list = []  # list of (xl_row, xl_to_sheet, xf)
-    _pila_otpr_seen: set  = set()
+    # Простые профили/пластины из отправочных файлов (без подэлементов) -> ПИЛА / ПЛАЗМА
+    _pila_from_otpr: list   = []  # list of (xl_row, xl_to_sheet, xf)
+    _plasma_from_otpr: list = []  # list of (xl_row, xl_to_sheet, xf) — пластины
+    _otpr_asm_qty_by_mark: dict = {}  # марка(lower) -> кол-во учтённое через СБОРКА (0 = деталь не входит в сборки)
+    _pila_otpr_seen: set    = set()
+    _assembly_qty:   dict   = {}      # марка.lower() -> суммарное кол-во через СБОРКА
+    _mark_to_spec:   dict   = {}      # марка.lower() -> 'ПЛАЗМА' или 'ПИЛА'
+
+    # Предварительно строим карту масс из Отправочных (для СБОРКА/СВАРКА строк без массы в grouper)
+    _otpr_mass_map: dict = {}  # элемент.lower() -> (mass_ed, mass_all_or_None)
+    for _pm_item in source_map:
+        if _pm_item['spec'] not in ('ГРУНТОВКА', 'ПОКРАСКА'):
+            continue
+        for _pm_entry in _pm_item.get('entries', []):
+            if not _pm_entry.get('active', True):
+                continue
+            try:
+                _pm_rows, _pm_map = _parse(_pm_entry['file'])
+            except Exception:
+                continue
+            _pm_elem_xi   = next((xi for xi, n in _pm_map.items() if n in ('ЭЛЕМЕНТ', 'Марка')), None)
+            _pm_massed_xi = next((xi for xi, n in _pm_map.items() if n == 'МАССА ЕД. (кг)'), None)
+            _pm_massall_xi = next((xi for xi, n in _pm_map.items() if 'МАССА ВСЕХ' in n), None)
+            if _pm_elem_xi is None or _pm_massed_xi is None:
+                continue
+            for _pmr in _pm_rows:
+                if _pm_elem_xi >= len(_pmr) or not _pmr[_pm_elem_xi]:
+                    continue
+                _pmkey = str(_pmr[_pm_elem_xi]).strip().lower()
+                if _pmkey in _otpr_mass_map:
+                    continue
+                try:
+                    _pme = float(str(_pmr[_pm_massed_xi]).replace(',', '.')) if _pm_massed_xi < len(_pmr) and _pmr[_pm_massed_xi] else None
+                except (ValueError, TypeError):
+                    _pme = None
+                try:
+                    _pma = float(str(_pmr[_pm_massall_xi]).replace(',', '.')) if _pm_massall_xi is not None and _pm_massall_xi < len(_pmr) and _pmr[_pm_massall_xi] else None
+                except (ValueError, TypeError):
+                    _pma = None
+                if _pme is not None:
+                    _otpr_mass_map[_pmkey] = (_pme, _pma)
 
     for item in source_map:
         spec    = item['spec']
@@ -1129,7 +1244,8 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
             continue
 
         # Дедупликация единая для всех файлов одной специализации
-        _seen_dedup: set = set()
+        _dedup_map: dict = {}  # dedup_key -> index in rows_to_write
+        _spec_seen_positions: set = set()  # позиции (ПЛАЗМА/ПИЛА), уже записанные из ЛЮБОГО файла этой спец.
 
         for entry in active_entries:
             xf = entry['file']
@@ -1153,26 +1269,70 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
             _dedup_pk_xi = next((xi for xi, n in xl_to_sheet.items()
                                  if n in ('ПОЗ. СОГЛАСНО ЧЕРТЕЖА', 'Марка', 'ЭЛЕМЕНТ')), None)
 
-            current_elem_grouper = None
-            current_grouper_qty  = 1.0
+            current_elem_grouper       = None
+            current_grouper_qty        = 1.0
+            current_grouper_mass_total = None
 
             rows_to_write = []
+            _dedup_map = {}
             for xl_row in data_rows:
                 if all(c is None or str(c).strip() == '' for c in xl_row):
                     continue
-                # Пропускаем строки-итоги из Excel (Итого (кг), ИТОГО и т.п.)
+                # Пропускаем строки-итоги из Excel (Итого (кг), ИТОГО, Добавление массы сварки, Общая масса и т.п.)
                 first_vals = [str(c).strip().lower() for c in xl_row if c is not None and str(c).strip()]
-                if first_vals and first_vals[0].startswith('итог'):
+                _FOOTER_PREFIXES = ('итог', 'добавление массы', 'общая масса', 'общий вес')
+                if first_vals and first_vals[0].startswith(_FOOTER_PREFIXES):
                     continue
-                # Grouper-строка: «Поз.=К1д Количество=4 ...»
-                if first_vals and first_vals[0].startswith('поз.='):
-                    import re as _re_grp
-                    _c0 = str(xl_row[0]).strip() if xl_row[0] is not None else ''
+                # Grouper-строка: «Поз.=К1д Количество=4 ...» или «СТОЛБ. Количество=1»
+                import re as _re_grp
+                _c0 = str(xl_row[0]).strip() if xl_row[0] is not None else ''
+                _is_poz_grouper = first_vals and first_vals[0].startswith('поз.=')
+                _new_grp_m = _re_grp.search(r'(?i)количество\s*=\s*(\d+(?:[.,]\d+)?)', _c0)
+                _is_new_grouper = bool(_new_grp_m) and not _is_poz_grouper
+                if _is_poz_grouper:
                     _gm = _re_grp.match(r'(?i)поз[.\s]*=\s*(\S+)', _c0)
                     if _gm:
                         current_elem_grouper = _gm.group(1).strip()
                     _qm = _re_grp.search(r'(?i)количество\s*=\s*(\d+(?:[.,]\d+)?)', _c0)
                     current_grouper_qty = float(_qm.group(1).replace(',', '.')) if _qm else 1.0
+                    _mm = _re_grp.search(r'(?i)масса\s+всего\s*=\s*([\d.,]+)', _c0)
+                    current_grouper_mass_total = float(_mm.group(1).replace(',', '.')) if _mm else None
+                elif _is_new_grouper:
+                    _nm = _re_grp.match(r'^(.*?)\s+[Кк]оличество\s*=', _c0)
+                    current_elem_grouper = _nm.group(1).rstrip('. ').strip() if _nm else _c0
+                    current_grouper_qty = float(_new_grp_m.group(1).replace(',', '.'))
+                    current_grouper_mass_total = None
+                if _is_poz_grouper or _is_new_grouper:
+                    # Для СБОРКА/СВАРКА: grouper-строка = сборочный элемент -> пишем как строку данных
+                    if spec in ('СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА') and current_elem_grouper:
+                        _DEFAULTS_G = {'СТАТУС': 'ПЛАН', 'ОБЯЗАТЕЛЬНАЯ': 'НЕТ'}
+                        # Масса: из grouper или из Отправочных
+                        _gkey = current_elem_grouper.lower()
+                        if current_grouper_mass_total is not None:
+                            _mass_ed  = round(current_grouper_mass_total / current_grouper_qty, 4) if current_grouper_qty else ''
+                            _mass_all = current_grouper_mass_total
+                        elif _gkey in _otpr_mass_map:
+                            _mass_ed, _mass_all_raw = _otpr_mass_map[_gkey]
+                            _mass_all = _mass_all_raw if _mass_all_raw is not None else round(_mass_ed * current_grouper_qty, 4)
+                        else:
+                            _mass_ed = _mass_all = ''
+                        _grow = [str(uuid.uuid4())]
+                        for _gcol in sheet_cols[1:]:
+                            if _gcol == 'ЭЛЕМЕНТ':
+                                _grow.append(current_elem_grouper)
+                            elif _gcol == 'КОЛ-ВО':
+                                _grow.append(current_grouper_qty)
+                            elif _gcol == 'МАССА ЕД. (кг)':
+                                _grow.append(_mass_ed)
+                            elif _gcol == 'МАССА ВСЕХ (кг)':
+                                _grow.append(_mass_all)
+                            else:
+                                _grow.append(_DEFAULTS_G.get(_gcol, ''))
+                        rows_to_write.append(_grow)
+                        _assembly_qty[current_elem_grouper.lower()] = _assembly_qty.get(current_elem_grouper.lower(), 0.0) + current_grouper_qty
+                    continue
+                # Для СБОРКА/СВАРКА из Сборки-файла: component-строки не нужны
+                if spec in ('СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА') and current_elem_grouper is not None:
                     continue
                 # Пропускаем строки-разделители где PRIMARY KEY пуст
                 _PK_COL = ('ПОЗ. СОГЛАСНО ЧЕРТЕЖА' if spec in ('ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ')
@@ -1224,11 +1384,33 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 _grp_elem = current_elem_grouper if spec not in ('ПЛАЗМА', 'ПИЛА') else ''
                 if _dedup_pk_xi is not None:
                     _pk_raw2 = xl_row[_dedup_pk_xi] if _dedup_pk_xi < len(xl_row) and xl_row[_dedup_pk_xi] else ''
-                    _dedup_key = (spec, str(_pk_raw2).strip(), _grp_elem)
-                    if _dedup_key in _seen_dedup:
+                    _pk_key2 = str(_pk_raw2).strip().lower()
+                    if spec in ('ПЛАЗМА', 'ПИЛА') and _pk_key2 and _pk_key2 in _spec_seen_positions and (spec, str(_pk_raw2).strip(), _grp_elem) not in _dedup_map:
+                        # Позиция уже загружена из ДРУГОГО файла этой же специализации — дубль, пропускаем
                         continue
-                    _seen_dedup.add(_dedup_key)
-
+                    _dedup_key = (spec, str(_pk_raw2).strip(), _grp_elem)
+                    if _dedup_key in _dedup_map and spec in ('ПЛАЗМА', 'ПИЛА', 'СВЕРЛЕНИЕ'):
+                        # Суммируем КОЛ-ВО и добавляем grouper в ЭЛЕМЕНТ
+                        _ex_idx = _dedup_map[_dedup_key]
+                        _ex_row = rows_to_write[_ex_idx]
+                        _kvo_ci2 = next((i for i, c in enumerate(sheet_cols) if c == 'КОЛ-ВО'), None)
+                        if _kvo_ci2 is not None:
+                            _kvo_xi2 = next((xi for xi, n in xl_to_sheet.items() if n == 'КОЛ-ВО'), None)
+                            if _kvo_xi2 is not None:
+                                _add_raw = xl_row[_kvo_xi2] if _kvo_xi2 < len(xl_row) else None
+                                try:
+                                    _add_qty = float(str(_add_raw).strip().replace(',', '.')) * current_grouper_qty
+                                    _cur_qty = _ex_row[_kvo_ci2]
+                                    if isinstance(_cur_qty, (int, float)):
+                                        _ex_row[_kvo_ci2] = _cur_qty + _add_qty
+                                except (ValueError, TypeError):
+                                    pass
+                        _elem_ci2 = next((i for i, c in enumerate(sheet_cols) if c == 'ЭЛЕМЕНТ'), None)
+                        if _elem_ci2 is not None and current_elem_grouper:
+                            _cur_elem = str(_ex_row[_elem_ci2]).strip() if _elem_ci2 < len(_ex_row) else ''
+                            if current_elem_grouper not in _cur_elem.split(', '):
+                                _ex_row[_elem_ci2] = (_cur_elem + ', ' + current_elem_grouper).strip(', ')
+                        continue
                 _DEFAULTS = {'СТАТУС': 'ПЛАН', 'ОБЯЗАТЕЛЬНАЯ': 'НЕТ'}
                 sheet_row = [str(uuid.uuid4())]
                 for col_name in sheet_cols[1:]:
@@ -1236,13 +1418,16 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                     for xi, mapped_name in xl_to_sheet.items():
                         if mapped_name == col_name and xi < len(xl_row):
                             raw = xl_row[xi]
-                            _NUM_COLS = {'КОЛ-ВО', 'МАССА ЕД. (кг)', 'МАССА ВСЕХ (кг)', 'Поверхность\nЭлемент (м²)'}
+                            _NUM_COLS = {'КОЛ-ВО', 'МАССА ЕД. (кг)', 'МАССА ВСЕХ (кг)', 'Поверхность\nЭлемент (м²)', 'КОЛ-ВО ОТВЕРСТИЙ'}
                             if col_name in _NUM_COLS and raw is not None:
                                 try:
                                     _fval = float(str(raw).strip().replace(',', '.'))
                                     if col_name == 'КОЛ-ВО' and current_grouper_qty != 1.0:
                                         _fval = _fval * current_grouper_qty
-                                    val = _fval
+                                    if col_name == 'КОЛ-ВО ОТВЕРСТИЙ' and _fval == int(_fval):
+                                        val = int(_fval)
+                                    else:
+                                        val = _fval
                                 except (ValueError, TypeError):
                                     val = str(raw).strip() if raw is not None else ''
                             else:
@@ -1259,24 +1444,16 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                             sheet_row.append('')
                         if not sheet_row[_elem_ci]:
                             sheet_row[_elem_ci] = current_elem_grouper
-                # Для отправочных файлов: если у элемента нет подэлементов -> ПИЛА вместо СБОРКА/СВАРКА
-                if spec in ('СБОРКА', 'СВАРКА') and 'отправочн' in xf.get('name', '').lower():
-                    import re as _re_otpr
-                    _elem_raw_xi = next((xi for xi, n in xl_to_sheet.items()
-                                        if 'элемент' in n.lower() and n != 'ЭЛЕМЕНТ'), None)
-                    _marka_xi    = next((xi for xi, n in xl_to_sheet.items() if n == 'ЭЛЕМЕНТ'), None)
-                    if _elem_raw_xi is not None and _marka_xi is not None:
-                        _elem_cell  = str(xl_row[_elem_raw_xi]).strip() if _elem_raw_xi < len(xl_row) and xl_row[_elem_raw_xi] else ''
-                        _marka_cell = str(xl_row[_marka_xi]).strip()    if _marka_xi  < len(xl_row) and xl_row[_marka_xi]    else ''
-                        _subparts   = [s.strip() for s in _re_otpr.findall(r'\d+\.\s*(\S+)', _elem_cell)]
-                        _is_simple  = bool(_subparts and len(_subparts) == 1
-                                           and _subparts[0].lower() == _marka_cell.lower())
-                        if _is_simple:
-                            if spec == 'СБОРКА' and _marka_cell not in _pila_otpr_seen:
-                                _pila_from_otpr.append((xl_row, xl_to_sheet, xf))
-                                _pila_otpr_seen.add(_marka_cell)
-                            continue  # пропускаем для СБОРКА и СВАРКА
                 rows_to_write.append(sheet_row)
+                if _dedup_pk_xi is not None:
+                    _dedup_map[_dedup_key] = len(rows_to_write) - 1
+                    if spec in ('ПЛАЗМА', 'ПИЛА') and _pk_key2:
+                        _spec_seen_positions.add(_pk_key2)
+                # Запоминаем маршрут марки для supplement из Отправочных
+                if spec in ('ПЛАЗМА', 'ПИЛА') and _dedup_pk_xi is not None:
+                    _pk_mark = xl_row[_dedup_pk_xi] if _dedup_pk_xi < len(xl_row) and xl_row[_dedup_pk_xi] else None
+                    if _pk_mark:
+                        _mark_to_spec[str(_pk_mark).strip().lower()] = spec
 
                 # Если у строки есть отверстия — запоминаем для СВЕРЛЕНИЕ
                 if spec in ('ПИЛА', 'ПЛАЗМА'):
@@ -1305,7 +1482,19 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                     return (e, p)
                 rows_to_write.sort(key=_sort_key)
             if rows_to_write:
-                existing = ws_gs.get_all_values()
+                # Retry на 429 при чтении листа
+                import time as _time_gав
+                for _retry_gав in range(4):
+                    try:
+                        existing = ws_gs.get_all_values()
+                        break
+                    except Exception as _e_gав:
+                        if '429' in str(_e_gав) and _retry_gав < 3:
+                            _wait = 30 * (2 ** _retry_gав)
+                            log.warning(f'load_excel_data: 429 get_all_values {spec}, retry {_retry_gав+1} через {_wait}s')
+                            _time_gав.sleep(_wait)
+                        else:
+                            raise
                 existing_count = sum(1 for r in existing[2:] if any(c for c in r))
                 # Вставляем формулу МАССА ВСЕХ = КОЛ-ВО × МАССА ЕД.
                 kol_idx     = next((i for i, c in enumerate(sheet_cols) if c == 'КОЛ-ВО'), None)
@@ -1334,8 +1523,9 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                             while len(srow) <= _sum_i:
                                 srow.append('')
                             srow[_sum_i] = f'={c_col}{rn}*{d_col}{rn}*{e_col}{rn}'
-                ws_gs.update(rows_to_write, range_name=f'A{3 + existing_count}',
-                             value_input_option='USER_ENTERED')
+                sheets._wapi_call(ws_gs.update, rows_to_write,
+                                  range_name=f'A{3 + existing_count}',
+                                  value_input_option='USER_ENTERED')
 
             count = len(rows_to_write)
             stats[spec] = stats.get(spec, 0) + count
@@ -1344,7 +1534,66 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
         if spec in stats:
             itogo_tasks.append({'ws_id': ws_gs.id, 'data_count': stats[spec], 'cols': sheet_cols})
 
-    # Простые профили из отправочных файлов -> ПИЛА
+    # Supplement: Отправочные -> ПЛАЗМА/ПИЛА (только позиции не в сборках)
+    _otpr_files_seen: set = set()
+    for _sup_item in source_map:
+        if _sup_item['spec'] not in ('ГРУНТОВКА', 'ПОКРАСКА'):
+            continue
+        for _sup_entry in _sup_item.get('entries', []):
+            if not _sup_entry.get('active', True):
+                continue
+            _sup_xf = _sup_entry['file']
+            if _sup_xf['id'] in _otpr_files_seen:
+                continue
+            _otpr_files_seen.add(_sup_xf['id'])
+            try:
+                _sup_rows, _sup_map = _parse(_sup_xf)
+            except Exception:
+                continue
+            # Только Отправочные-формат: есть ЭЛЕМЕНТ, нет СЕЧЕНИЕ
+            _has_sec_col = any(n == 'СЕЧЕНИЕ' for n in _sup_map.values())
+            if _has_sec_col:
+                continue
+            _mk_xi2 = next((xi for xi, n in _sup_map.items() if n == 'ЭЛЕМЕНТ'), None)
+            if _mk_xi2 is None:
+                continue
+            for _sup_row in _sup_rows:
+                if all(c is None or str(c).strip() == '' for c in _sup_row):
+                    continue
+                _c0s = str(_sup_row[0]).strip().lower() if _sup_row[0] else ''
+                if _c0s.startswith(('поз.=', 'итог', 'добавление массы', 'общая масса', 'общий вес')):
+                    continue
+                _mark2 = str(_sup_row[_mk_xi2]).strip() if _mk_xi2 < len(_sup_row) and _sup_row[_mk_xi2] else ''
+                if not _mark2:
+                    continue
+                _mark2_l = _mark2.lower()
+                if _mark2 in _pila_otpr_seen:
+                    continue
+                # Вычитаем кол-во уже учтённых через СБОРКА
+                _kv2_xi = next((xi for xi, n in _sup_map.items() if n == 'КОЛ-ВО'), None)
+                _kv2_raw = _sup_row[_kv2_xi] if _kv2_xi is not None and _kv2_xi < len(_sup_row) and _sup_row[_kv2_xi] else None
+                try:
+                    _otpr_qty = float(str(_kv2_raw).replace(',', '.')) if _kv2_raw is not None else 0.0
+                except (ValueError, TypeError):
+                    _otpr_qty = 0.0
+                _asm_qty = _assembly_qty.get(_mark2_l, 0.0)
+                _otpr_asm_qty_by_mark[_mark2_l] = _asm_qty
+                _direct_qty = _otpr_qty - _asm_qty
+                if _direct_qty <= 0:
+                    _pila_otpr_seen.add(_mark2)
+                    continue
+                # Клонируем строку с уточнённым КОЛ-ВО
+                _sup_row2 = list(_sup_row)
+                if _kv2_xi is not None:
+                    _sup_row2[_kv2_xi] = _direct_qty
+                _target_spec2 = _mark_to_spec.get(_mark2_l)
+                if _target_spec2 == 'ПЛАЗМА':
+                    _plasma_from_otpr.append((_sup_row2, _sup_map, _sup_xf))
+                else:
+                    _pila_from_otpr.append((_sup_row2, _sup_map, _sup_xf))
+                _pila_otpr_seen.add(_mark2)
+
+    # Простые профили/пластины из отправочных файлов -> ПИЛА / ПЛАЗМА
     if _pila_from_otpr:
         try:
             ws_pila_otp = ss.worksheet('ПИЛА')
@@ -1382,13 +1631,50 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 if _st_ci  is not None: _srow[_st_ci]  = 'ПЛАН'
                 if _lnk_ci is not None: _srow[_lnk_ci] = _lk
                 pila_rows_otp.append(_srow)
+            # Для позиций из Отправочных: если позиция уже есть в ПИЛА (из Сборки) — суммируем КОЛ-ВО
+            if pila_rows_otp:
+                _pila_hdr = existing_pila_otp[1] if len(existing_pila_otp) > 1 else []
+                _pila_pos_hdr_idx = next((i for i, h in enumerate(_pila_hdr) if h == 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА'), 1)
+                _pila_pos_row = {}  # pos_lower -> (sheet_row_1indexed, cur_kvo_str)
+                for _si, _r in enumerate(existing_pila_otp[2:], start=3):
+                    if any(c for c in _r):
+                        _pv = _r[_pila_pos_hdr_idx].strip().lower() if _pila_pos_hdr_idx < len(_r) else ''
+                        if _pv and _kvo_ci is not None:
+                            _cur_kvo_str = _r[_kvo_ci].strip() if _kvo_ci < len(_r) else ''
+                            _pila_pos_row[_pv] = (_si, _cur_kvo_str)
+                _kvo_cell_updates = []
+                _new_pila_rows_otp = []
+                for _ro in pila_rows_otp:
+                    _pos_key = str(_ro[_pos_ci]).strip().lower()
+                    if _pos_key in _pila_pos_row and _kvo_ci is not None:
+                        if _otpr_asm_qty_by_mark.get(_pos_key, 0.0) <= 0:
+                            # Марка не входит ни в одну сборку — позиция в ПИЛА уже
+                            # загружена напрямую (не через СБОРКА), это дубль. Пропускаем.
+                            continue
+                        _sheet_ri, _cur_kvo_str = _pila_pos_row[_pos_key]
+                        _add_kvo = _ro[_kvo_ci]
+                        try:
+                            _cur_kvo = float(_cur_kvo_str.replace(',', '.')) if _cur_kvo_str else 0.0
+                            _add_kvo_f = float(str(_add_kvo).replace(',', '.')) if _add_kvo else 0.0
+                            _kvo_col_letter = chr(ord('A') + _kvo_ci)
+                            _kvo_cell_updates.append((f'{_kvo_col_letter}{_sheet_ri}', _cur_kvo + _add_kvo_f))
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        _new_pila_rows_otp.append(_ro)
+                for _cell_addr, _new_kvo in _kvo_cell_updates:
+                    sheets._wapi_call(ws_pila_otp.update, [[_new_kvo]], range_name=_cell_addr,
+                                      value_input_option='USER_ENTERED')
+                if _kvo_cell_updates:
+                    stats['ПИЛА'] = stats.get('ПИЛА', 0) + len(_kvo_cell_updates)
+                pila_rows_otp = _new_pila_rows_otp
             if pila_rows_otp and _kvo_ci is not None and _med_ci is not None and _mall_ci is not None:
                 _start_po = 3 + _ex_pila
                 for ri, srow in enumerate(pila_rows_otp):
                     rn = _start_po + ri
                     kc = chr(ord('A') + _kvo_ci); mc = chr(ord('A') + _med_ci)
                     srow[_mall_ci] = f'={kc}{rn}*{mc}{rn}'
-                ws_pila_otp.update(pila_rows_otp, range_name=f'A{3+_ex_pila}',
+                sheets._wapi_call(ws_pila_otp.update, pila_rows_otp, range_name=f'A{3+_ex_pila}',
                                    value_input_option='USER_ENTERED')
                 stats['ПИЛА'] = stats.get('ПИЛА', 0) + len(pila_rows_otp)
                 # Update itogo_tasks so ИТОГО does not overwrite Пр1
@@ -1399,6 +1685,98 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 log.info(f'load_excel_data: ПИЛА <- простые профили из отправочных: {len(pila_rows_otp)} строк')
         except Exception as _e_otp:
             log.warning(f'load_excel_data: ошибка записи профилей из отправочных в ПИЛА: {_e_otp}')
+
+    # Пластины из отправочных файлов -> ПЛАЗМА
+    if _plasma_from_otpr:
+        try:
+            ws_plasma_otp = ss.worksheet('ПЛАЗМА')
+            plasma_cols_otp = col_defs.get('ПЛАЗМА', [])
+            existing_plasma_otp = ws_plasma_otp.get_all_values()
+            _ex_plasma  = sum(1 for r in existing_plasma_otp[2:] if any(c for c in r))
+            _kvo_ci_p   = next((i for i, c in enumerate(plasma_cols_otp) if c == 'КОЛ-ВО'), None)
+            _med_ci_p   = next((i for i, c in enumerate(plasma_cols_otp) if 'МАССА ЕД' in c), None)
+            _mall_ci_p  = next((i for i, c in enumerate(plasma_cols_otp) if 'МАССА ВСЕХ' in c), None)
+            _pos_ci_p   = next((i for i, c in enumerate(plasma_cols_otp) if c == 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА'), 1)
+            _ob_ci_p    = next((i for i, c in enumerate(plasma_cols_otp) if c == 'ОБЯЗАТЕЛЬНАЯ'), None)
+            _st_ci_p    = next((i for i, c in enumerate(plasma_cols_otp) if c == 'СТАТУС'), None)
+            _lnk_ci_p   = next((i for i, c in enumerate(plasma_cols_otp) if 'ССЫЛКА' in c.upper()), None)
+            plasma_rows_otp: list = []
+            for _xl_r, _xl_m, _xf_o in _plasma_from_otpr:
+                _mk_xi = next((xi for xi, n in _xl_m.items() if n == 'ЭЛЕМЕНТ'), None)
+                _kv_xi = next((xi for xi, n in _xl_m.items() if n == 'КОЛ-ВО'), None)
+                _me_xi = next((xi for xi, n in _xl_m.items() if 'МАССА ЕД' in n), None)
+                _lk_xi = next((xi for xi, n in _xl_m.items() if 'ССЫЛКА' in n.upper()), None)
+                _mk = str(_xl_r[_mk_xi]).strip() if _mk_xi is not None and _mk_xi < len(_xl_r) and _xl_r[_mk_xi] else ''
+                _kv = _xl_r[_kv_xi] if _kv_xi is not None and _kv_xi < len(_xl_r) else None
+                _me = _xl_r[_me_xi] if _me_xi is not None and _me_xi < len(_xl_r) else None
+                _lk = str(_xl_r[_lk_xi]).strip() if _lk_xi is not None and _lk_xi < len(_xl_r) and _xl_r[_lk_xi] else ''
+                if not _mk: continue
+                _srow = [''] * len(plasma_cols_otp)
+                _srow[0] = str(uuid.uuid4())
+                _srow[_pos_ci_p] = _mk
+                if _kvo_ci_p is not None and _kv is not None:
+                    try: _srow[_kvo_ci_p] = float(str(_kv).replace(',', '.'))
+                    except: _srow[_kvo_ci_p] = str(_kv)
+                if _med_ci_p is not None and _me is not None:
+                    try: _srow[_med_ci_p] = float(str(_me).replace(',', '.'))
+                    except: _srow[_med_ci_p] = str(_me)
+                if _ob_ci_p  is not None: _srow[_ob_ci_p]  = 'НЕТ'
+                if _st_ci_p  is not None: _srow[_st_ci_p]  = 'ПЛАН'
+                if _lnk_ci_p is not None: _srow[_lnk_ci_p] = _lk
+                plasma_rows_otp.append(_srow)
+            # Для позиций из Отправочных: если позиция уже есть в ПЛАЗМА (из Сборки) — суммируем КОЛ-ВО
+            if plasma_rows_otp:
+                _plasma_hdr = existing_plasma_otp[1] if len(existing_plasma_otp) > 1 else []
+                _plasma_pos_hdr_idx = next((i for i, h in enumerate(_plasma_hdr) if h == 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА'), 1)
+                _plasma_pos_row = {}  # pos_lower -> (sheet_row_1indexed, cur_kvo_str)
+                for _si, _r in enumerate(existing_plasma_otp[2:], start=3):
+                    if any(c for c in _r):
+                        _pv = _r[_plasma_pos_hdr_idx].strip().lower() if _plasma_pos_hdr_idx < len(_r) else ''
+                        if _pv and _kvo_ci_p is not None:
+                            _cur_kvo_str = _r[_kvo_ci_p].strip() if _kvo_ci_p < len(_r) else ''
+                            _plasma_pos_row[_pv] = (_si, _cur_kvo_str)
+                _kvo_cell_updates_p = []
+                _new_plasma_rows_otp = []
+                for _ro in plasma_rows_otp:
+                    _pos_key = str(_ro[_pos_ci_p]).strip().lower()
+                    if _pos_key in _plasma_pos_row and _kvo_ci_p is not None:
+                        if _otpr_asm_qty_by_mark.get(_pos_key, 0.0) <= 0:
+                            # Марка не входит ни в одну сборку — позиция в ПЛАЗМА уже
+                            # загружена напрямую (не через СБОРКА), это дубль. Пропускаем.
+                            continue
+                        _sheet_ri, _cur_kvo_str = _plasma_pos_row[_pos_key]
+                        _add_kvo = _ro[_kvo_ci_p]
+                        try:
+                            _cur_kvo = float(_cur_kvo_str.replace(',', '.')) if _cur_kvo_str else 0.0
+                            _add_kvo_f = float(str(_add_kvo).replace(',', '.')) if _add_kvo else 0.0
+                            _kvo_col_letter = chr(ord('A') + _kvo_ci_p)
+                            _kvo_cell_updates_p.append((f'{_kvo_col_letter}{_sheet_ri}', _cur_kvo + _add_kvo_f))
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        _new_plasma_rows_otp.append(_ro)
+                for _cell_addr, _new_kvo in _kvo_cell_updates_p:
+                    sheets._wapi_call(ws_plasma_otp.update, [[_new_kvo]], range_name=_cell_addr,
+                                      value_input_option='USER_ENTERED')
+                if _kvo_cell_updates_p:
+                    stats['ПЛАЗМА'] = stats.get('ПЛАЗМА', 0) + len(_kvo_cell_updates_p)
+                plasma_rows_otp = _new_plasma_rows_otp
+            if plasma_rows_otp and _kvo_ci_p is not None and _med_ci_p is not None and _mall_ci_p is not None:
+                _start_pp = 3 + _ex_plasma
+                for ri, srow in enumerate(plasma_rows_otp):
+                    rn = _start_pp + ri
+                    kc = chr(ord('A') + _kvo_ci_p); mc = chr(ord('A') + _med_ci_p)
+                    srow[_mall_ci_p] = f'={kc}{rn}*{mc}{rn}'
+                sheets._wapi_call(ws_plasma_otp.update, plasma_rows_otp, range_name=f'A{3+_ex_plasma}',
+                                   value_input_option='USER_ENTERED')
+                stats['ПЛАЗМА'] = stats.get('ПЛАЗМА', 0) + len(plasma_rows_otp)
+                for _it in itogo_tasks:
+                    if _it["ws_id"] == ws_plasma_otp.id:
+                        _it["data_count"] += len(plasma_rows_otp)
+                        break
+                log.info(f'load_excel_data: ПЛАЗМА <- простые пластины из отправочных: {len(plasma_rows_otp)} строк')
+        except Exception as _e_otp_p:
+            log.warning(f'load_excel_data: ошибка записи пластин из отправочных в ПЛАЗМА: {_e_otp_p}')
 
     if itogo_tasks:
         _add_itogo_rows(sheet_id, itogo_tasks)
@@ -1426,7 +1804,7 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 for col_name in sv_cols[1:]:
                     val = None
                     if col_name == 'КОЛ-ВО ОТВЕРСТИЙ':
-                        val = _holes_qty
+                        val = int(_holes_qty) if _holes_qty == int(_holes_qty) else _holes_qty
                     else:
                         for xi, mapped_name in _xmap.items():
                             if mapped_name == col_name and xi < len(_xrow):
@@ -1453,8 +1831,24 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
             if sv_rows_to_write:
                 existing_sv = ws_sv.get_all_values()
                 existing_sv_count = sum(1 for r in existing_sv[2:] if any(c for c in r))
-                ws_sv.update(
-                    [[str(c) if c is not None else '' for c in r] for r in sv_rows_to_write],
+                # Исключаем позиции, уже записанные в СВЕРЛЕНИЕ напрямую
+                _sv_pos_col = next((i for i, c in enumerate(sv_cols) if c == 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА'), 1)
+                _existing_sv_pos = set()
+                if len(existing_sv) > 2:
+                    _sv_hdr = existing_sv[1] if len(existing_sv) > 1 else []
+                    _sv_pos_hdr_idx = next((i for i, h in enumerate(_sv_hdr) if h == 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА'), 1)
+                    for _r in existing_sv[2:]:
+                        if any(c for c in _r):
+                            _pv = _r[_sv_pos_hdr_idx].strip().lower() if _sv_pos_hdr_idx < len(_r) else ''
+                            if _pv:
+                                _existing_sv_pos.add(_pv)
+                if _existing_sv_pos:
+                    sv_rows_to_write = [
+                        r for r in sv_rows_to_write
+                        if str(r[_sv_pos_col]).strip().lower() not in _existing_sv_pos
+                    ]
+                sheets._wapi_call(ws_sv.update,
+                    [[int(c) if isinstance(c, float) and c == int(c) else (c if isinstance(c, (int, float)) else (str(c) if c is not None else '')) for c in r] for r in sv_rows_to_write],
                     range_name=f'A{3 + existing_sv_count}',
                     value_input_option='USER_ENTERED'
                 )
@@ -1559,9 +1953,9 @@ def add_data_validations(sheet_id: str, active_specs: list[str], row_counts: dic
                 }})
 
     if requests:
-        service.spreadsheets().batchUpdate(
+        _wexec(service.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id, body={'requests': requests}
-        ).execute()
+        ))
         log.info(f'add_data_validations: {len(requests)} правил добавлено')
 
 
@@ -1655,10 +2049,10 @@ def fill_element_column(sheet_id: str, bom: dict, active_specs: list[str]) -> in
             total += 1
 
         if updates:
-            service.spreadsheets().values().batchUpdate(
+            _wexec(service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
                 body={'valueInputOption': 'RAW', 'data': updates},
-            ).execute()
+            ))
             log.info(f'fill_element_column: {spec} — zapolneno {len(updates)} yacheek ELEMENT')
 
     return total
@@ -1987,7 +2381,7 @@ def cut_pdf_drawings(drawings_folder_id: str) -> dict:
                         body={'name': final_name, 'parents': [drawings_folder_id]},
                         media_body=media,
                         fields='id',
-                    ).execute()
+                    )
                     uploaded_fid = uploaded['id']
                     _clog(f'  ✓ СОЗДАН {final_name} (id={uploaded_fid})')
                     uploaded_this_file += 1
@@ -1996,7 +2390,7 @@ def cut_pdf_drawings(drawings_folder_id: str) -> dict:
                     copied = drive_oauth.files().copy(
                         fileId=uploaded_fid,
                         body={'name': final_name, 'parents': [drawings_folder_id]},
-                    ).execute()
+                    )
                     _clog(f'  ✓ КОПИЯ  {final_name} (id={copied["id"]})')
 
                 files_result[final_mark] = uploaded_fid if uploaded_fid else uploaded_fid
@@ -2101,14 +2495,28 @@ def link_drawings(sheet_id: str, drawings_folder_id: str, active_specs: list[str
     import os as _os
     import re as _re
 
-    # Извлекаем позиционные коды из имени файла: буквы+цифры+необязательные_буквы
-    # Примеры: К1, пб1, Св1а, тс10, П2г, шп14
-    _POS_RE = _re.compile(r'[а-яёa-zА-ЯЁA-Z]+\d+[а-яёA-ZА-ЯЁa-z]*', _re.IGNORECASE)
+    # Гомоглифы: кириллица/латиница визуально неотличимы (с/c, а/a, е/e, о/o, р/p, х/x) —
+    # источники (Excel/PDF-имена) набираются вперемешку разными людьми/раскладками.
+    # Приводим оба берега сравнения к единому (латинскому) виду.
+    _HOMOGLYPH_MAP = str.maketrans({
+        'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'х': 'x',
+        'А': 'A', 'Е': 'E', 'О': 'O', 'Р': 'P', 'С': 'C', 'Х': 'X',
+    })
+
+    def _norm_homoglyph(s: str) -> str:
+        return s.translate(_HOMOGLYPH_MAP)
+
+    # Извлекаем позиционные коды из имени файла: буквы+цифры(-цифры)?+необязательные_буквы
+    # Примеры: К1, пб1, Св1а, тс10, П2г, шп14, с2-9
+    _POS_RE = _re.compile(r'[а-яёa-zА-ЯЁA-Z]+\d+(?:-\d+)*[а-яёA-ZА-ЯЁa-z]*', _re.IGNORECASE)
 
     def _extract_positions(name: str) -> list:
         base = _os.path.splitext(name)[0]
         tokens = _POS_RE.findall(base)
-        return [t.strip().lower() for t in tokens if len(t) >= 2]
+        return [
+            _norm_homoglyph(_re.sub(r'[\s_-]+', '', t.strip().lower()))
+            for t in tokens if len(t) >= 2
+        ]
 
     # drawing_index: позиционный_код -> url
     # Один PDF может содержать несколько позиций (первый файл выигрывает при дублях)
@@ -2123,10 +2531,37 @@ def link_drawings(sheet_id: str, drawings_folder_id: str, active_specs: list[str
              f'кодов в индексе={len(drawing_index)}, примеры={list(drawing_index.keys())[:10]}')
 
     # ─── Заполнение в каждом листе ───────────────────────────────────────────
+    import time as _time_ld
+    _ld_t0 = _time_ld.time()
+    _ld_reads = 0
+    _ld_writes = 0
+
+    log.info(f'link_drawings: [t=0.0s] открываем spreadsheet {sheet_id}')
     gc = _gc(SCOPES_RW)
-    ss = gc.open_by_key(sheet_id)
+    ss = _w(gc.open_by_key, sheet_id)
+    _ld_reads += 1
+    log.info(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] открыт, reads={_ld_reads}')
+
     service = _sheets_service()
     total_linked = 0
+
+    # Загружаем ВСЕ листы одним batch_values_get вместо N get_all_values
+    _spec_ranges = [f"{s}!A:ZZ" for s in active_ordered if col_defs.get(s)]
+    _batch_vals: dict = {}
+    try:
+        log.info(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] batch_values_get {len(_spec_ranges)} листов')
+        _resp_batch = _w(
+            ss.values_batch_get,
+            ranges=_spec_ranges,
+            params={'valueRenderOption': 'FORMATTED_VALUE', 'majorDimension': 'ROWS'},
+        )
+        _ld_reads += 1
+        log.info(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] batch done, reads={_ld_reads}')
+        for _vr in (_resp_batch or {}).get('valueRanges', []):
+            _sh_title = _vr.get('range', '').split('!')[0].strip("'")
+            _batch_vals[_sh_title] = _vr.get('values', [])
+    except Exception as _be:
+        log.warning(f'link_drawings: batch_values_get failed: {_be}, fallback to per-sheet')
 
     for spec in active_ordered:
         cols = col_defs.get(spec)
@@ -2141,12 +2576,17 @@ def link_drawings(sheet_id: str, drawings_folder_id: str, active_specs: list[str
         if match_col_idx is None or link_col_idx is None:
             continue
 
-        try:
-            ws = ss.worksheet(spec)
-        except Exception:
-            continue
+        if spec in _batch_vals:
+            all_vals = _batch_vals[spec]
+        else:
+            try:
+                log.info(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] fallback get_all_values {spec}, reads={_ld_reads+1}')
+                ws = _w(ss.worksheet, spec)
+                all_vals = _w(ws.get_all_values)
+                _ld_reads += 1
+            except Exception:
+                continue
 
-        all_vals = ws.get_all_values()
         if len(all_vals) < 3:   # нет данных
             continue
 
@@ -2157,7 +2597,7 @@ def link_drawings(sheet_id: str, drawings_folder_id: str, active_specs: list[str
             pos_raw = row[match_col_idx].strip() if match_col_idx < len(row) else ''
             if not pos_raw:
                 continue
-            pos_val = _re.sub(r'[\s_-]+', '', pos_raw.lower())
+            pos_val = _norm_homoglyph(_re.sub(r'[\s_-]+', '', pos_raw.lower()))
 
             # Точное совпадение (после нормализации)
             url = drawing_index.get(pos_val)
@@ -2177,10 +2617,17 @@ def link_drawings(sheet_id: str, drawings_folder_id: str, active_specs: list[str
                 total_linked += 1
 
         if updates:
-            ws.batch_update(updates, value_input_option='USER_ENTERED')
-            log.info(f'link_drawings: {spec} — заполнено {len(updates)} ссылок')
+            log.info(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] batch_update {spec} {len(updates)} ссылок, writes={_ld_writes+1}')
+            try:
+                ws2 = _w(ss.worksheet, spec)
+                _w(ws2.batch_update, updates, value_input_option='USER_ENTERED')
+                _ld_writes += 1
+                log.info(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] {spec} done')
+            except Exception as _ue:
+                log.error(f'link_drawings: [t={_time_ld.time()-_ld_t0:.1f}s] {spec} update error: {_ue}')
         time.sleep(1)  # rate limit
 
+    log.info(f'link_drawings: ИТОГО t={_time_ld.time()-_ld_t0:.1f}s reads={_ld_reads} writes={_ld_writes} linked={total_linked}')
     return total_linked
 
 

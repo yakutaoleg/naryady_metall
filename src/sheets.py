@@ -1,5 +1,6 @@
 import gspread
 import time
+import threading
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -84,7 +85,41 @@ def apply_column_standards(file_id: str, sheet_name: str):
 
 
 
-_svc_cache = {}
+class _TLDict:
+    """dict с отдельным содержимым на каждый поток: клиенты Google (httplib2/requests) нельзя делить между потоками."""
+    def __init__(self):
+        self._l = threading.local()
+
+    @property
+    def _d(self):
+        d = getattr(self._l, 'd', None)
+        if d is None:
+            d = self._l.d = {}
+        return d
+
+    def __contains__(self, k):
+        return k in self._d
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+    def __setitem__(self, k, v):
+        self._d[k] = v
+
+    def pop(self, *a):
+        return self._d.pop(*a)
+
+    def get(self, *a):
+        return self._d.get(*a)
+
+    def clear(self):
+        self._d.clear()
+
+    def __iter__(self):
+        return iter(list(self._d))
+
+
+_svc_cache = _TLDict()
 
 def _service():
     if 'v4' not in _svc_cache:
@@ -103,7 +138,7 @@ SCOPES_RW = [
     'https://www.googleapis.com/auth/drive.readonly'
 ]
 
-_gc_cache  = {}   # scopes_key → gspread client
+_gc_cache  = _TLDict()   # scopes_key → gspread client (на поток)
 # Нестандартные листы (ОСИ 11-15, Щучин) имеют другие заголовки.
 # Ключ — стандартное имя, значение — реальное имя в листе.
 _SHEET_COL_ALIASES = {
@@ -121,15 +156,27 @@ _SHEET_COL_ALIASES = {
     },
 }
 
-_ss_cache  = {}   # (file_id, rw) → spreadsheet object
-_ws_cache  = {}   # (file_id, sheet_name, rw) → worksheet object
+_ss_cache  = _TLDict()   # (file_id, rw) → spreadsheet object (на поток)
+_ws_cache  = _TLDict()   # (file_id, sheet_name, rw) → worksheet object (на поток)
 _hdr_cache = {}   # (file_id, sheet_name) → col_map dict
+
+import collections as _collections
+_API_STATS = _collections.Counter()
+
+
+def api_stats(reset: bool = False) -> dict:
+    snap = dict(_API_STATS)
+    if reset:
+        _API_STATS.clear()
+    return snap
+
 
 def _api_call(fn, *args, **kwargs):
     """Retry on 429/503: 60s → 90s → 120s → 180s (per-minute quota windows)."""
     import copy
     waits = [60, 90, 120, 180]
     for attempt in range(5):
+        _API_STATS[getattr(fn, '__name__', 'fn')] += 1
         try:
             # gspread batch_update мутирует ranges в переданном списке (добавляет 'Sheet'! prefix).
             # При retry это приводит к двойному/тройному префиксу — передаём deepcopy.
@@ -142,6 +189,17 @@ def _api_call(fn, *args, **kwargs):
                 time.sleep(wait)
             else:
                 raise
+
+# Глобальный лок для write-операций в Sheets API.
+# Синк и визард конкурируют за 60 write req/min.
+# _wapi_call захватывает лок → второй поток ждёт, вместо 429.
+_WRITE_LOCK = threading.Lock()
+
+def _wapi_call(fn, *args, **kwargs):
+    """Как _api_call, но с глобальным write-локом.
+    Гарантирует что только один поток пишет в Sheets в каждый момент."""
+    with _WRITE_LOCK:
+        return _api_call(fn, *args, **kwargs)
 
 def _gc(scopes=None):
     key = tuple(scopes or SCOPES_RO)
@@ -193,6 +251,8 @@ def _invalidate_ws(file_id: str, sheet_name: str):
     _ws_cache.pop((file_id, sheet_name, True), None)
     _ws_cache.pop((file_id, sheet_name, False), None)
     _hdr_cache.pop((file_id, sheet_name), None)
+    for _k in [k for k in _rowres_cache if k[0] == file_id and k[1] == sheet_name]:
+        _rowres_cache.pop(_k, None)
 
 
 def find_active_files():
@@ -277,8 +337,60 @@ def write_row_ids(file_id: str, sheet_name: str, row_ids: list[tuple[int, str]])
     _api_call(ws.batch_update, updates)
 
 
-def insert_remainder_row(file_id: str, sheet_name: str, after_row_num: int, row_data: dict):
+_rowres_cache: dict = {}
+
+
+def _resolve_row_num(file_id: str, sheet_name: str, row_num: int) -> int:
+    """Актуальный row_num строки в листе.
+
+    row_num в БД обновляется только синком (раз в 15 мин), а бот вставляет строки-остатки
+    (и мастер может добавлять строки вручную) — строки ниже сдвигаются, и запись по
+    «старому» row_num попадает в соседнюю строку. Сверяем ROW_ID задачи (из БД) с реальной
+    строкой листа; при расхождении ищем строку по колонке ROW_ID."""
+    try:
+        from src import db
+        rec = db.fetchone(
+            "SELECT row_id FROM work_orders WHERE file_id=%s AND sheet_name=%s AND row_num=%s",
+            [file_id, sheet_name, row_num]
+        )
+        rid = (rec or {}).get('row_id')
+        if not rid:
+            return row_num
+        key = (file_id, sheet_name, row_num, rid)
+        hit = _rowres_cache.get(key)
+        if hit and time.time() - hit[1] < 30:
+            return hit[0]
+        cm = _col_map(file_id, sheet_name, rw=True)
+        id_col = cm.get('ROW_ID')
+        if not id_col:
+            return row_num
+        ws = _ws(file_id, sheet_name, rw=True)
+        if row_num >= 1:
+            cell = _api_call(ws.get, f'{_col_letter(id_col)}{row_num + 2}')
+            actual = cell[0][0] if cell and cell[0] else ''
+            if actual == rid:
+                _rowres_cache[key] = (row_num, time.time())
+                return row_num
+        col_vals = _api_call(ws.col_values, id_col)
+        if rid in col_vals:
+            resolved = col_vals.index(rid) - 1   # индекс списка i -> строка листа i+1 -> row_num = i-1
+            if resolved != row_num:
+                import logging
+                logging.getLogger('sheets').warning(
+                    f'_resolve_row_num: {sheet_name} row_num {row_num} -> {resolved} (ROW_ID {rid})')
+            _rowres_cache[key] = (resolved, time.time())
+            return resolved
+    except Exception as _e:
+        import logging
+        logging.getLogger('sheets').warning(f'_resolve_row_num failed ({sheet_name}/{row_num}): {_e}')
+    return row_num
+
+
+def insert_remainder_row(file_id: str, sheet_name: str, after_row_num: int, row_data: dict,
+                         verify: bool = True):
     """Вставляет строку-остаток сразу после указанной, копируя формат."""
+    if verify:
+        after_row_num = _resolve_row_num(file_id, sheet_name, after_row_num)
     cm = _col_map(file_id, sheet_name, rw=True)
     ws = _ws(file_id, sheet_name, rw=True)
     ss = _ss(file_id, rw=True)
@@ -323,8 +435,10 @@ def insert_remainder_row(file_id: str, sheet_name: str, after_row_num: int, row_
     _invalidate_ws(file_id, sheet_name)
 
 
-def delete_row(file_id: str, sheet_name: str, row_num: int):
+def delete_row(file_id: str, sheet_name: str, row_num: int, verify: bool = True):
     """Удаляет строку по row_num (0-indexed, данные начинаются с row 3)."""
+    if verify:
+        row_num = _resolve_row_num(file_id, sheet_name, row_num)
     ws = _ws(file_id, sheet_name, rw=True)
     _api_call(ws.delete_rows, row_num + 2)
     _invalidate_ws(file_id, sheet_name)
@@ -370,7 +484,10 @@ def apply_status_format(file_id: str, sheet_name: str, row_num: int, status: str
         logging.getLogger(__name__).warning("apply_status_format error: %s", e)
 
 
-def update_cell_by_header(file_id: str, sheet_name: str, row_num: int, header: str, value):
+def update_cell_by_header(file_id: str, sheet_name: str, row_num: int, header: str, value,
+                          verify: bool = True):
+    if verify:
+        row_num = _resolve_row_num(file_id, sheet_name, row_num)
     cm  = _col_map(file_id, sheet_name, rw=True)
     col = cm.get(_actual_header(file_id, sheet_name, header))
     if not col:
@@ -393,8 +510,10 @@ _NEXT_SPEC = {
 
 def update_task_status(file_id: str, sheet_name: str, row_num: int,
                        status: str, comment: str = None, date_fact: str = None,
-                       qty_done: int = None, block_val=None):
+                       qty_done: int = None, block_val=None, verify: bool = True):
     """Обновляет статус/комментарий/дату/выполнено одним батч-запросом."""
+    if verify:
+        row_num = _resolve_row_num(file_id, sheet_name, row_num)
     cm = _col_map(file_id, sheet_name, rw=True)
     ws = _ws(file_id, sheet_name, rw=True)
 

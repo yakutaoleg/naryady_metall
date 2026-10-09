@@ -1,0 +1,11 @@
+[Unit]
+Description=Naryady Sheets Sync, 5 min after previous run finished (PROD)
+
+[Timer]
+OnBootSec=2min
+OnActiveSec=1min
+OnUnitInactiveSec=5min
+Unit=naryady-sync-prod.service
+
+[Install]
+WantedBy=timers.target

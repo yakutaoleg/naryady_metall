@@ -1,0 +1,11 @@
+[Unit]
+Description=Naryady nightly consistency check (PROD)
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/naryady/prod
+ExecStart=/root/naryady/test/venv/bin/python src/consistency_check.py
+TimeoutStartSec=1800
+StandardOutput=append:/root/naryady/prod/logs/consistency.log
+StandardError=append:/root/naryady/prod/logs/consistency.log

@@ -1,0 +1,11 @@
+[Unit]
+Description=Naryady Sheets Sync (PROD)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+User=root
+WorkingDirectory=/root/naryady/prod
+ExecStart=/root/naryady/test/venv/bin/python src/sync.py
+StandardOutput=append:/root/naryady/prod/logs/sync.log
+StandardError=append:/root/naryady/prod/logs/sync.log

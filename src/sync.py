@@ -101,15 +101,15 @@ def _do_auto_split(file_id: str, sheet_name: str, project_name: str, project_id:
         'ROW_ID':                new_row_id,
         'ССЫЛКА НА ЧЕРТЁЖ':     row.get('ССЫЛКА НА ЧЕРТЁЖ', '') or '',
     }
-    sheets.insert_remainder_row(file_id, sheet_name, row_num, remainder_data)
+    sheets.insert_remainder_row(file_id, sheet_name, row_num, remainder_data, verify=False)
 
     sheets.update_task_status(
         file_id=file_id, sheet_name=sheet_name, row_num=row_num,
-        status='ВЫПОЛНЕНО', date_fact=today, qty_done=qty_done,
+        status='ВЫПОЛНЕНО', date_fact=today, qty_done=qty_done, verify=False,
     )
-    sheets.update_cell_by_header(file_id, sheet_name, row_num, 'КОЛ-ВО', qty_done)
+    sheets.update_cell_by_header(file_id, sheet_name, row_num, 'КОЛ-ВО', qty_done, verify=False)
     if ps_done is not None:
-        sheets.update_cell_by_header(file_id, sheet_name, row_num, 'СУММА К ОПЛАТЕ', ps_done)
+        sheets.update_cell_by_header(file_id, sheet_name, row_num, 'СУММА К ОПЛАТЕ', ps_done, verify=False)
 
     logger.info(f'  {sheet_name}: авто-сплит строка {row_num} → '
                 f'ВЫПОЛНЕНО({qty_done}) + ПЛАН(остаток {remaining})')
@@ -191,6 +191,7 @@ ON CONFLICT (project_name, sheet_name, row_num) DO UPDATE SET
                              WHERE r2.file_id   = work_orders.file_id
                                AND r2.sheet_name = work_orders.sheet_name
                                AND r2.position   = work_orders.position
+                               AND r2.element    = work_orders.element
                                AND r2.status     = 'ПЛАН'
                                AND r2.id        != work_orders.id
                          )
@@ -279,11 +280,16 @@ def _compute_block(project_name: str, sheet_name: str, position: str, element: s
             continue
         seen_sheets.add(d['requires_sheet'])
         rp = d['requires_position']
-        # Все строки upstream для этого элемента/позиции
+        # Все строки upstream для этого элемента/позиции.
+        # ЭЛЕМЕНТ может быть объединён через запятую (одна деталь — компонент
+        # нескольких сборок, напр. "П4, П5") — ловим это через ILIKE-границы.
         rows = db.fetchall(
             """SELECT position, status, COALESCE(quantity, 0) as qty FROM work_orders
-               WHERE project_name=%s AND sheet_name=%s AND (element=%s OR position=%s)""",
-            [project_name, d['requires_sheet'], rp, rp]
+               WHERE project_name=%s AND sheet_name=%s
+                 AND (element=%s OR position=%s
+                      OR element LIKE %s OR element LIKE %s OR element LIKE %s)""",
+            [project_name, d['requires_sheet'], rp, rp,
+             rp + ', %', '%, ' + rp, '%, ' + rp + ', %']
         )
         if not rows:
             continue
@@ -345,7 +351,10 @@ def _compute_block(project_name: str, sheet_name: str, position: str, element: s
     return '\n'.join(parts)
 
 
-def _update_block_column(file_id: str, sheet_name: str, project_name: str, rows: list[dict] = None):
+def _update_block_column(file_id: str, sheet_name: str, project_name: str, rows: list[dict] = None,
+                         raw_values: list = None):
+    """Пересчитывает колонку БЛОК. Пишет в лист ТОЛЬКО ячейки, значение которых изменилось.
+    raw_values — уже прочитанные значения листа (batchGet), чтобы не читать лист повторно."""
     cm = sheets._col_map(file_id, sheet_name, rw=True)
     block_col = cm.get('БЛОК')
     row_id_col = cm.get('ROW_ID')
@@ -353,20 +362,29 @@ def _update_block_column(file_id: str, sheet_name: str, project_name: str, rows:
         return
     ws = sheets._ws(file_id, sheet_name, rw=True)
 
-    # Строим map ROW_ID → реальный номер строки через чтение листа
-    row_id_to_sheet_row = {}
-    if row_id_col:
+    row_id_to_sheet_row = {}   # ROW_ID → номер строки листа
+    current_block = {}         # номер строки листа → текущее значение БЛОК
+    itogo_rows = []            # [(номер строки, текущий БЛОК)] — у ИТОГО БЛОК очищается
+    all_vals = raw_values
+    if all_vals is None and row_id_col:
         try:
             all_vals = sheets._api_call(ws.get_all_values)
-            # row 1 = заголовок, row 2 = подзаголовок, данные с row 3 (idx=2)
-            for idx, row_data in enumerate(all_vals[2:], start=3):
-                cell_idx = row_id_col - 1
-                if cell_idx < len(row_data):
-                    rid = row_data[cell_idx].strip()
-                    if rid:
-                        row_id_to_sheet_row[rid] = idx
         except Exception as e:
             logger.warning(f'_update_block_column: не удалось прочитать ROW_ID {sheet_name}: {e}')
+            all_vals = None
+    if all_vals is not None and row_id_col:
+        bi = block_col - 1
+        for idx, row_data in enumerate(all_vals[2:], start=3):
+            cur_b = row_data[bi] if bi < len(row_data) else ''
+            if any(c.strip() == 'ИТОГО' for c in row_data):
+                itogo_rows.append((idx, cur_b))
+                continue
+            cell_idx = row_id_col - 1
+            if cell_idx < len(row_data):
+                rid = row_data[cell_idx].strip()
+                if rid:
+                    row_id_to_sheet_row[rid] = idx
+                    current_block[idx] = cur_b
 
     work_rows = db.fetchall(
         """SELECT row_num, row_id, position, element, status,
@@ -397,17 +415,26 @@ def _update_block_column(file_id: str, sheet_name: str, project_name: str, rows:
             sheet_row = r['row_num'] + 2
 
         key = (r['position'] or r['element'] or '').strip()
-        if r['status'] == 'ВЫПОЛНЕНО':
-            # Дублируем БЛОК от одноимённой ПЛАН-строки (если есть)
-            val = pos_block_val.get(key, '')
-        else:
-            val = pos_block_val.get(key, '')
+        val = pos_block_val.get(key, '')
+        if row_id_col and current_block.get(sheet_row, None) == val:
+            continue   # в листе уже то же значение — запись не нужна
         updates.append({
             'range': f'{sheets._col_letter(block_col)}{sheet_row}',
             'values': [[val]]
         })
     for i in range(0, len(updates), 100):
         sheets._api_call(ws.batch_update, updates[i:i+100])
+
+    # Очищаем БЛОК у строк ИТОГО (только если там что-то есть)
+    clear_rows = [r for r, cur_b in itogo_rows if cur_b]
+    if clear_rows:
+        blok_letter = sheets._col_letter(block_col)
+        clear_upd = [{'range': f'{blok_letter}{r}', 'values': [['']]} for r in clear_rows]
+        for i in range(0, len(clear_upd), 100):
+            try:
+                sheets._api_call(ws.batch_update, clear_upd[i:i+100])
+            except Exception as e:
+                logger.warning(f'_update_block_column: очистка ИТОГО {sheet_name}: {e}')
 
 
 UPSERT_EMPLOYEE_SQL = '''
@@ -424,8 +451,11 @@ def _upsert_employees(rows: list[dict], sheet_name: str):
     if sheet_name not in config.WORK_SHEETS:
         return
     seen = set()
+    _SERVICE_NAMES = {'ИСПОЛНИТЕЛЬ', 'ИСПОЛНИТЕЛИ', 'ФИО', 'НЕ УКАЗАН', '-', '—'}
     for row in rows:
         name = row.get('ИСПОЛНИТЕЛЬ', '').strip()
+        if name.upper() in _SERVICE_NAMES:
+            continue
         if name and name not in seen:
             seen.add(name)
             db.execute(UPSERT_EMPLOYEE_SQL, [name, sheet_name, sheet_name, sheet_name])
@@ -462,11 +492,32 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
         if 'WorksheetNotFound' not in str(type(_ze)) and 'not found' not in str(_ze).lower():
             logger.warning(f'  ЗАВИСИМОСТИ sheet error ({project_name}): {_ze}')
 
+    # Читаем все листы одним batch-запросом (1 API call вместо 8)
+    _SHEET_RANGES = ['ПИЛА!A:Z', 'ПЛАЗМА!A:Z', 'СВЕРЛЕНИЕ!A:Z',
+                     'СБОРКА!A:Z', 'СВАРКА!A:Z', 'ГРУНТОВКА!A:Z', 'ПОКРАСКА!A:Z']
+    _batch_data: dict = {}
+    try:
+        _gc_rb = sheets._gc(sheets.SCOPES_RO)
+        _ss_rb = _gc_rb.open_by_key(file_id)
+        _resp = sheets._api_call(
+            _ss_rb.values_batch_get,
+            ranges=_SHEET_RANGES,
+            params={'valueRenderOption': 'FORMATTED_VALUE', 'majorDimension': 'ROWS'},
+        )
+        for _vr in (_resp or {}).get('valueRanges', []):
+            _title = _vr.get('range', '').split('!')[0].strip("'")
+            _batch_data[_title] = _vr.get('values', [])
+    except Exception as _be:
+        logger.warning(f'  _rebuild batch_get failed ({project_name}): {_be}')
+
     def get_elems(sheet_name, col='ЭЛЕМЕНТ'):
         try:
-            ws   = sheets._ws(file_id, sheet_name)
-            data = sheets._api_call(ws.get_all_values)
-            if len(data) < 2:
+            data = _batch_data.get(sheet_name)
+            if data is None:
+                # fallback: отдельный запрос если batch не вернул этот лист
+                ws   = sheets._ws(file_id, sheet_name)
+                data = sheets._api_call(ws.get_all_values)
+            if not data or len(data) < 2:
                 return set()
             hdrs = data[1]
             idx  = next((i for i, h in enumerate(hdrs) if h.strip() == col), None)
@@ -474,9 +525,21 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
                 idx = next((i for i, h in enumerate(hdrs) if h.strip() == "ЭЛЕМЕНТ"), None)
             if idx is None:
                 return set()
-            return {r[idx].strip() for r in data[2:]
-                    if len(r) > idx and r[idx].strip()
-                    and r[idx].strip() not in ('ИТОГО', '')}
+            result = set()
+            for r in data[2:]:
+                if len(r) <= idx:
+                    continue
+                v = r[idx].strip()
+                if not v or v == 'ИТОГО':
+                    continue
+                # ЭЛЕМЕНТ может быть объединён через запятую (одна деталь — компонент
+                # нескольких сборок, напр. "П4, П5") — разбиваем на отдельные теги,
+                # иначе зависимость не находится ни для одной из них.
+                for part in v.split(','):
+                    part = part.strip()
+                    if part:
+                        result.add(part)
+            return result
         except Exception as e:
             logger.error(f'  _rebuild: не удалось прочитать {sheet_name}/{col}: {e}')
             return set()
@@ -492,22 +555,29 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
 
     deps = []
     plazma_upper = {e.upper(): e for e in plazma}
+    pila_all = pila | pila_pos  # ЭЛЕМЕНТ + ПОЗ. СОГЛАСНО ЧЕРТЕЖА из ПИЛА
 
-    # СВЕРЛЕНИЕ <- ПИЛА (прямое) + ПЛАЗМА (last-word)
-    for e in sverlenie & pila:
+    # СВЕРЛЕНИЕ <- ПИЛА (по любой колонке) + ПЛАЗМА (прямое совпадение или last-word)
+    for e in sverlenie & pila_all:
         deps.append(('СВЕРЛЕНИЕ', e, 'ПИЛА', e))
     for se in sverlenie:
-        pm = plazma_upper.get(se.split()[-1].upper())
-        if pm:
-            deps.append(('СВЕРЛЕНИЕ', se, 'ПЛАЗМА', pm))
+        if se in plazma:
+            deps.append(('СВЕРЛЕНИЕ', se, 'ПЛАЗМА', se))
+        else:
+            pm = plazma_upper.get(se.split()[-1].upper())
+            if pm:
+                deps.append(('СВЕРЛЕНИЕ', se, 'ПЛАЗМА', pm))
 
-    # СБОРКА <- ПИЛА (прямое) + ПЛАЗМА (last-word), НЕ зависит от СВЕРЛЕНИЯ
-    for e in sborka & pila:
+    # СБОРКА <- ПИЛА + ПЛАЗМА (прямое совпадение или last-word)
+    for e in sborka & pila_all:
         deps.append(('СБОРКА', e, 'ПИЛА', e))
     for se in sborka:
-        pm = plazma_upper.get(se.split()[-1].upper())
-        if pm:
-            deps.append(('СБОРКА', se, 'ПЛАЗМА', pm))
+        if se in plazma:
+            deps.append(('СБОРКА', se, 'ПЛАЗМА', se))
+        else:
+            pm = plazma_upper.get(se.split()[-1].upper())
+            if pm:
+                deps.append(('СБОРКА', se, 'ПЛАЗМА', pm))
 
     # СВАРКА <- СБОРКА + СВЕРЛЕНИЕ (оба должны быть выполнены)
     for e in svarka & sborka:
@@ -515,13 +585,15 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
     for e in svarka & sverlenie:
         deps.append(('СВАРКА', e, 'СВЕРЛЕНИЕ', e))
 
-    # ГРУНТОВКА <- СВАРКА, ПОКРАСКА <- ГРУНТОВКА
+    # ГРУНТОВКА <- СВАРКА
     for e in grunt & svarka:
         deps.append(('ГРУНТОВКА', e, 'СВАРКА', e))
-    # ГРУНТОВКА <- ПИЛА (простые профили: есть в ГРУНТОВКА и ПИЛА.ПОЗ, нет в СВАРКА)
+    # ГРУНТОВКА <- ПИЛА или ПЛАЗМА (прямые элементы: нет в СВАРКА)
     for e in grunt - svarka:
-        if e in pila_pos:
+        if e in pila_all:
             deps.append(('ГРУНТОВКА', e, 'ПИЛА', e))
+        elif e in plazma:
+            deps.append(('ГРУНТОВКА', e, 'ПЛАЗМА', e))
     for e in pokraska & grunt:
         deps.append(('ПОКРАСКА', e, 'ГРУНТОВКА', e))
 
@@ -556,6 +628,7 @@ def _reconcile_blocks(project_name: str):
         """SELECT wo.id, wo.element, wo.position, wo.sheet_name, wo.file_id, wo.row_num
            FROM work_orders wo
            WHERE wo.project_name=%s AND wo.status='БЛОК'
+             AND (wo.comment IS NULL OR wo.comment = '')
              AND (wo.element IS NOT NULL OR wo.position IS NOT NULL)
              AND EXISTS (
                SELECT 1 FROM element_dependencies ed
@@ -600,18 +673,248 @@ def _reconcile_blocks(project_name: str):
         logger.info(f'  Reconcile ({project_name}): разблокировано {unblocked} задач')
 
 
-def run(progress_cb=None):
+def _sync_employees_sheet(file_id: str, project_name: str):
+    """Обновляет левую таблицу листа СОТРУДНИКИ из БД (cols A:F, строки 4+)."""
+    employees = db.fetchall(
+        "SELECT full_name, specialization, telegram_username "
+        "FROM employees WHERE is_active=true ORDER BY full_name",
+        []
+    )
+
+    emp_rows = []
+    for emp in employees:
+        specs = emp['specialization'] or []
+        tg    = emp['telegram_username'] or ''
+        emp_rows.append(['', emp['full_name'], ', '.join(specs), tg, 'ДА', ''])
+
+    # Заполняем до 100 строк пустыми чтобы затереть старые данные
+    MAX_ROWS = 100
+    while len(emp_rows) < MAX_ROWS:
+        emp_rows.append(['', '', '', '', '', ''])
+
+    try:
+        _h_emp = _sheet_hash(emp_rows)
+        _st_emp = _state_get(project_name, '__employees__')
+        if _st_emp and _st_emp['content_hash'] == _h_emp and float(_st_emp['age'] or 0) < FULL_REFRESH_SEC:
+            return
+        ws = sheets._ws(file_id, 'СОТРУДНИКИ', rw=True)
+        sheets._wapi_call(ws.update, emp_rows, 'A4')
+        _state_set(project_name, '__employees__', _h_emp)
+        logger.info(f'  [{project_name}] СОТРУДНИКИ: обновлено {len(employees)} сотрудников')
+    except Exception as e:
+        if 'WorksheetNotFound' in type(e).__name__ or 'not found' in str(e).lower():
+            logger.info(f'  [{project_name}] СОТРУДНИКИ: лист отсутствует, пропускаем')
+        else:
+            logger.warning(f'  [{project_name}] СОТРУДНИКИ: ошибка обновления — {e}')
+
+
+def _repair_orphan_partials(dry_run: bool = False) -> list:
+    """Достраивает частичное выполнение, оборванное падением процесса.
+
+    Признак: строка ВЫПОЛНЕНО с qty_done < quantity (в листе КОЛ-ВО не успели уменьшить),
+    история подтверждает ИМЕННО эту строку (по row_id), строки-остатка нет.
+    Достраиваем: КОЛ-ВО/МАССА/СУММА = выполненная часть + строка-остаток ПЛАН.
+    Строки моложе 5 минут не трогаем (обработчик бота мог быть ещё в работе)."""
+    import uuid as _uuid
+    rows = db.fetchall(
+        """SELECT wo.id, wo.project_name, wo.file_id, wo.sheet_name, wo.row_num, wo.row_id,
+                  wo.position, wo.element, wo.quantity, wo.qty_done, wo.payment_sum,
+                  wo.unit_weight, wo.total_weight, wo.drawing_link, wo.qty_holes
+           FROM work_orders wo
+           WHERE wo.status = 'ВЫПОЛНЕНО' AND wo.qty_done IS NOT NULL AND wo.qty_done < wo.quantity
+             AND wo.project_name IN (SELECT project_name FROM projects WHERE status='АКТИВНЫЙ')
+             AND wo.row_num > 0 AND wo.row_id IS NOT NULL
+             AND wo.date_fact >= CURRENT_DATE - 2
+             AND wo.updated_at < NOW() - INTERVAL '5 minutes'
+             AND (SELECT COALESCE(SUM(h.qty), 0) FROM work_order_history h WHERE h.row_id = wo.row_id) = wo.qty_done
+             AND NOT EXISTS (
+                 SELECT 1 FROM work_orders r
+                 WHERE r.project_name = wo.project_name AND r.sheet_name = wo.sheet_name AND r.id <> wo.id
+                   AND COALESCE(r.position, '') = COALESCE(wo.position, '')
+                   AND COALESCE(r.element, '') = COALESCE(wo.element, '')
+                   AND r.status IN ('ПЛАН', 'ЧАСТИЧНО', 'БЛОК')
+                   AND r.quantity = wo.quantity - wo.qty_done)""",
+        []
+    )
+    if dry_run or not rows:
+        return [dict(r) for r in rows]
+    for t in rows:
+        try:
+            orig, done = float(t['quantity']), int(t['qty_done'])
+            remaining = int(orig) - done
+            ps, tw = float(t['payment_sum'] or 0), float(t['total_weight'] or 0)
+            ps_done, ps_rem = round(ps / orig * done, 2), round(ps / orig * remaining, 2)
+            tw_done, tw_rem = round(tw / orig * done, 3), round(tw / orig * remaining, 3)
+            new_row_id = str(_uuid.uuid4())
+            with db.transaction() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE work_orders SET quantity=%s, total_weight=%s, payment_sum=%s WHERE id=%s",
+                        [done, tw_done if tw else None, ps_done if ps else None, t['id']])
+                    cur.execute(
+                        "INSERT INTO work_orders (project_name, file_id, sheet_name, row_num, row_id, position, element, "
+                        "quantity, unit_weight, total_weight, payment_sum, executor, date_plan, priority, mandatory, "
+                        "status, drawing_link, qty_holes) "
+                        "SELECT project_name, file_id, sheet_name, -%s, %s, position, element, %s, unit_weight, %s, %s, "
+                        "       NULL, NULL, priority, false, 'ПЛАН', drawing_link, qty_holes FROM work_orders WHERE id=%s",
+                        [t['id'], new_row_id, remaining, tw_rem if tw else None, ps_rem if ps else None, t['id']])
+            f, s, rn = t['file_id'], t['sheet_name'], t['row_num']
+            sheets.update_cell_by_header(f, s, rn, 'КОЛ-ВО', done)
+            if tw:
+                sheets.update_cell_by_header(f, s, rn, 'МАССА ВСЕХ (кг)', tw_done)
+            if ps:
+                sheets.update_cell_by_header(f, s, rn, 'СУММА К ОПЛАТЕ', ps_done)
+            sheets.insert_remainder_row(f, s, rn, {
+                'ЭЛЕМЕНТ': t['element'] or '', 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА': t['position'] or '',
+                'КОЛ-ВО': remaining,
+                'МАССА ЕД. (кг)': float(t['unit_weight']) if t['unit_weight'] else '',
+                'МАССА ВСЕХ (кг)': tw_rem if tw else '', 'СУММА К ОПЛАТЕ': ps_rem if ps else '',
+                'СТАТУС': 'ПЛАН', 'ОБЯЗАТЕЛЬНАЯ': 'НЕТ', 'ИСПОЛНИТЕЛЬ': '', 'ROW_ID': new_row_id,
+                'ССЫЛКА НА ЧЕРТЁЖ': t['drawing_link'] or '',
+            })
+            logger.info(f"  repair_orphan_partials: {t['project_name']}/{s} id={t['id']} {done}+{remaining}")
+            logger.audit(action='auto_repair_partial',
+                         details={'task_id': t['id'], 'project': t['project_name'], 'sheet': s,
+                                  'done': done, 'remainder': remaining, 'remainder_row_id': new_row_id},
+                         result='success')
+        except Exception as e:
+            logger.error(f"  repair_orphan_partials id={t['id']}: {e}")
+    return [dict(r) for r in rows]
+
+
+import fcntl
+import hashlib
+import json as _json_s
+import os as _os_s
+
+_STATE_DIR = '/root/naryady/prod/state'
+FULL_REFRESH_SEC = 6 * 3600   # полная обработка листа не реже раза в 6 часов, даже если он не менялся
+
+
+def _ensure_sync_state():
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS sync_state ("
+        "project_name text NOT NULL, sheet_name text NOT NULL, content_hash text, "
+        "full_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project_name, sheet_name))", [])
+
+
+def _sheet_hash(values) -> str:
+    return hashlib.sha1(_json_s.dumps(values, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
+
+
+def _state_get(project_name: str, sheet_name: str):
+    return db.fetchone(
+        "SELECT content_hash, EXTRACT(EPOCH FROM (now() - full_at)) AS age "
+        "FROM sync_state WHERE project_name=%s AND sheet_name=%s", [project_name, sheet_name])
+
+
+def _state_set(project_name: str, sheet_name: str, h: str):
+    db.execute(
+        "INSERT INTO sync_state (project_name, sheet_name, content_hash, full_at) VALUES (%s,%s,%s,now()) "
+        "ON CONFLICT (project_name, sheet_name) DO UPDATE SET content_hash=EXCLUDED.content_hash, full_at=now()",
+        [project_name, sheet_name, h])
+
+
+class _ProjectLock:
+    """Межпроцессная блокировка проекта: два прохода синка не обрабатывают один проект одновременно."""
+    def __init__(self, project_id):
+        self.path = f'{_STATE_DIR}/sync_project_{project_id}.lock'
+        self.fd = None
+
+    def acquire(self, wait_sec: int = 0) -> bool:
+        _os_s.makedirs(_STATE_DIR, exist_ok=True)
+        self.fd = open(self.path, 'w')
+        deadline = time.time() + wait_sec
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if time.time() >= deadline:
+                    self.fd.close()
+                    self.fd = None
+                    return False
+                time.sleep(2)
+
+    def release(self):
+        if self.fd:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                self.fd.close()
+            finally:
+                self.fd = None
+
+
+TITLES_TTL_SEC = 3600
+
+
+def _existing_sheets(project_name: str, file_id: str, force: bool = False) -> list:
+    """Рабочие листы, которые реально существуют в таблице проекта. Запрашивать несуществующий лист
+    в batchGet нельзя (400 «Unable to parse range» → откат на чтение по листам = 7 запросов вместо 1)."""
+    if not force:
+        st = _state_get(project_name, '__titles__')
+        if st and st['content_hash'] and float(st['age'] or 0) < TITLES_TTL_SEC:
+            try:
+                names = _json_s.loads(st['content_hash'])
+                return [s for s in config.WORK_SHEETS if s in names]
+            except Exception:
+                pass
+    try:
+        ss = sheets._ss(file_id)
+        titles = [w.title for w in sheets._api_call(ss.worksheets)]
+    except Exception as e:
+        logger.warning(f'  {project_name}: не удалось получить список листов ({e}), работаем по полному списку')
+        return list(config.WORK_SHEETS)
+    _state_set(project_name, '__titles__', _json_s.dumps(titles, ensure_ascii=False))
+    return [s for s in config.WORK_SHEETS if s in titles]
+
+
+def _delete_stale_positional(project_name: str, sheet_name: str, nums: list, ids: list) -> int:
+    """Старые копии строк: row_id ещё есть в листе, но уже на другой позиции. Проверка «призраков» по одному row_id
+    их пропускала, и они дублировали задачу (в т.ч. оплату). Сверяем пары (row_num, row_id)."""
+    r = db.fetchone(
+        """
+        WITH del AS (
+            DELETE FROM work_orders w
+            WHERE w.project_name = %s AND w.sheet_name = %s
+              AND w.row_num > 0 AND w.row_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM unnest(%s::int[], %s::text[]) AS s(rn, rid)
+                  WHERE s.rn = w.row_num AND s.rid = w.row_id::text)
+            RETURNING 1
+        ) SELECT COUNT(*) AS cnt FROM del
+        """,
+        [project_name, sheet_name, [int(n) for n in nums], [str(i) for i in ids]]
+    )
+    return int(r['cnt']) if r else 0
+
+
+def _api_total() -> int:
+    return sum(sheets.api_stats().values())
+
+
+def run(progress_cb=None, only_project=None, force=False):
     """
     progress_cb(phase, data) — опциональный коллбек для отображения прогресса в боте.
     phase: 'project_start' | 'sheet_done' | 'project_done' | 'deps_done' | 'sync_done'
+    only_project — id или название проекта: синкать только его (кнопка в боте, новый проект).
+    force — не пропускать листы, которые не менялись.
     """
-    logger.info('Sync started')
+    logger.info('Sync started' + (f' (проект: {only_project}, force={force})' if only_project else ''))
+    _ensure_sync_state()
+    sheets.api_stats(reset=True)
     total_synced = 0
+    try:
+        _repair_orphan_partials()
+    except Exception as _e_rp:
+        logger.warning(f'repair_orphan_partials: {_e_rp}')
 
     projects = db.fetchall(
         "SELECT id, project_name, sheet_id FROM projects WHERE status='АКТИВНЫЙ'",
         []
     )
+    if only_project is not None:
+        projects = [p for p in projects if p['id'] == only_project or p['project_name'] == only_project]
     files = [{'id': p['id'], 'file_id': p['sheet_id'], 'project_name': p['project_name']} for p in projects]
 
     logger.info(f'Found {len(files)} active project(s) in DB')
@@ -621,28 +924,63 @@ def run(progress_cb=None):
     for f in files:
         file_id      = f['file_id']
         project_name = f['project_name']
+        _lock = _ProjectLock(f['id'])
+        if not _lock.acquire(wait_sec=300 if only_project is not None else 0):
+            logger.info(f'  {project_name}: уже обрабатывается другим процессом — пропуск')
+            sheets_done += len(config.WORK_SHEETS)
+            f['changed'] = False
+            continue
+        _calls0 = _api_total()
         logger.info(f'Processing: {project_name} ({file_id})')
 
         if progress_cb:
             progress_cb('project_start', {'project': project_name})
 
         sheet_errors = 0
+        project_changed = False
 
         # B: Читаем все листы проекта одним API-вызовом
+        _existing = _existing_sheets(project_name, file_id, force)
         try:
-            _batch_data = sheets.read_all_sheets_batch(file_id, config.WORK_SHEETS)
+            _batch_data = sheets.read_all_sheets_batch(file_id, _existing) if _existing else {}
             logger.info(f'  batchGet: загружено {len(_batch_data)} листов')
         except Exception as _be:
             logger.warning(f'  batchGet failed, fallback to per-sheet: {_be}')
             _batch_data = {}
 
         for sheet_name in config.WORK_SHEETS:
+            if sheet_name not in _existing:
+                sheets_done += 1
+                logger.info(f'  {sheet_name}: лист отсутствует, пропускаем')
+                if progress_cb:
+                    progress_cb('sheet_done', {
+                        'project': project_name, 'sheet': sheet_name, 'rows': 0,
+                        'sheets_done': sheets_done, 'total_sheets': total_sheets, 'splits': 0,
+                    })
+                continue
             try:
+                _pre = _batch_data.get(sheet_name)
+                _h = _sheet_hash(_pre) if _pre is not None else None
+                _degraded = False
+                if _h is not None and not force:
+                    _st = _state_get(project_name, sheet_name)
+                    if _st and _st['content_hash'] == _h and float(_st['age'] or 0) < FULL_REFRESH_SEC:
+                        sheets_done += 1
+                        if progress_cb:
+                            progress_cb('sheet_done', {
+                                'project': project_name, 'sheet': sheet_name,
+                                'rows': max(0, len(_pre) - 2), 'sheets_done': sheets_done,
+                                'total_sheets': total_sheets, 'splits': 0, 'skipped': True,
+                            })
+                        continue
                 rows = sheets.read_sheet(file_id, sheet_name,
-                                         preloaded=_batch_data.get(sheet_name))
+                                         preloaded=_pre)
                 _upsert_employees(rows, sheet_name)
                 pending_row_ids = []
                 seen_row_ids = []
+                seen_row_nums = []
+                pending_status_fix = []
+                pending_mandatory_fix = []
                 synced = 0
                 for i, row in enumerate(rows):
                     r = _normalize_row(row, sheet_name, i+1, project_name, file_id, f['id'])
@@ -651,13 +989,62 @@ def run(progress_cb=None):
                         r['row_id'] = new_id
                         pending_row_ids.append((i+1, new_id))
                     seen_row_ids.append(r['row_id'])
+                    seen_row_nums.append(i + 1)
                     db.execute(UPSERT_SQL, r)
                     synced += 1
+                    # Авто-ПЛАН: строка заполнена, но статус пустой
+                    if not row.get('СТАТУС', '').strip() and (
+                        r['position'] or r['element']
+                    ) and r['quantity']:
+                        pending_status_fix.append((i + 1, r['row_id']))
+                    # Авто-НЕТ: строка заполнена, ОБЯЗАТЕЛЬНАЯ пустая
+                    if not row.get('ОБЯЗАТЕЛЬНАЯ', '').strip() and (
+                        r['position'] or r['element']
+                    ) and r['quantity'] and r.get('status') != 'ИТОГО':
+                        pending_mandatory_fix.append((i + 1, r['row_id']))
                 total_synced += synced
+                if synced > 0:
+                    project_changed = True
 
                 if pending_row_ids:
                     sheets.write_row_ids(file_id, sheet_name, pending_row_ids)
                     logger.info(f'  {sheet_name}: записано {len(pending_row_ids)} новых ROW_ID')
+
+                # Авто-ПЛАН: ставим СТАТУС = 'ПЛАН' в лист для строк с пустым статусом
+                if pending_status_fix:
+                    try:
+                        cm_fix = sheets._col_map(file_id, sheet_name, rw=True)
+                        status_col = cm_fix.get('СТАТУС')
+                        if status_col:
+                            ws_fix = sheets._ws(file_id, sheet_name, rw=True)
+                            stat_letter = sheets._col_letter(status_col)
+                            fix_upd = [
+                                {'range': f'{stat_letter}{rn + 2}', 'values': [['ПЛАН']]}
+                                for rn, _ in pending_status_fix
+                            ]
+                            for i in range(0, len(fix_upd), 100):
+                                sheets._api_call(ws_fix.batch_update, fix_upd[i:i+100])
+                            logger.info(f'  {sheet_name}: авто-ПЛАН {len(pending_status_fix)} строк')
+                    except Exception as _sfix:
+                        logger.warning(f'  {sheet_name}: авто-ПЛАН пропущен: {_sfix}'); _degraded = True
+
+                # Авто-НЕТ: ставим ОБЯЗАТЕЛЬНАЯ = 'НЕТ' для строк с пустым полем
+                if pending_mandatory_fix:
+                    try:
+                        cm_mfix = sheets._col_map(file_id, sheet_name, rw=True)
+                        mand_col = cm_mfix.get('ОБЯЗАТЕЛЬНАЯ')
+                        if mand_col:
+                            ws_mfix = sheets._ws(file_id, sheet_name, rw=True)
+                            mand_letter = sheets._col_letter(mand_col)
+                            mfix_upd = [
+                                {'range': f'{mand_letter}{rn + 2}', 'values': [['НЕТ']]}
+                                for rn, _ in pending_mandatory_fix
+                            ]
+                            for i in range(0, len(mfix_upd), 100):
+                                sheets._api_call(ws_mfix.batch_update, mfix_upd[i:i+100])
+                            logger.info(f'  {sheet_name}: авто-НЕТ (ОБЯЗАТЕЛЬНАЯ) {len(pending_mandatory_fix)} строк')
+                    except Exception as _mfix:
+                        logger.warning(f'  {sheet_name}: авто-НЕТ пропущен: {_mfix}'); _degraded = True
 
                 # Призраки: строки в БД которых больше нет в листе
                 # Защита: пропускаем если лист прочитан пустым
@@ -676,11 +1063,14 @@ def run(progress_cb=None):
                     )
                     if ghost_del and ghost_del['cnt']:
                         logger.info(f'  {sheet_name}: удалено {ghost_del["cnt"]} призраков')
+                    _stale_n = _delete_stale_positional(project_name, sheet_name, seen_row_nums, seen_row_ids)
+                    if _stale_n:
+                        logger.info(f'  {sheet_name}: удалено {_stale_n} устаревших копий строк (row_id на другой позиции)')
 
                 try:
                     _apply_status_format_batch(file_id, sheet_name, rows)
                 except Exception as _fmt_err:
-                    logger.warning(f'  {sheet_name}: статус-форматирование пропущено: {_fmt_err}')
+                    logger.warning(f'  {sheet_name}: статус-форматирование пропущено: {_fmt_err}'); _degraded = True
 
                 _std_key = (file_id, sheet_name)
                 _now = _dt.now(timezone.utc).timestamp()
@@ -760,7 +1150,9 @@ def run(progress_cb=None):
                 logger.info(f'  {sheet_name}: {synced} rows')
                 logger.audit(action='sync_sheet',
                              details={'project': project_name, 'sheet': sheet_name, 'rows': synced})
-                _update_block_column(file_id, sheet_name, project_name, rows)
+                _update_block_column(file_id, sheet_name, project_name, rows, raw_values=_pre)
+                if _h is not None and not _degraded:
+                    _state_set(project_name, sheet_name, _h)
 
                 sheets_done += 1
                 if progress_cb:
@@ -799,44 +1191,61 @@ def run(progress_cb=None):
                 "UPDATE projects SET last_synced_at=NOW() WHERE id=%s",
                 [f['id']]
             )
+        f['changed'] = project_changed
         if progress_cb:
             progress_cb('project_done', {'project': project_name, 'errors': sheet_errors})
 
-        # Пауза между проектами — даём Google Sheets API сбросить per-minute квоту
-        if f != files[-1]:
+        _lock.release()
+        # Пауза между проектами — только если проект реально обращался к API (даём сбросить per-minute квоту)
+        if f != files[-1] and (_api_total() - _calls0) > 6:
             logger.info(f'  Пауза 15s перед следующим проектом...')
             time.sleep(15)
 
-    # Автогенерация зависимостей
-    for f in files:
-        try:
-            _rebuild_element_dependencies(f['project_name'], f['file_id'])
-        except Exception as e:
-            logger.error(f'  Зависимости rebuild error ({f["project_name"]}): {e}')
-
-    # Обновляем колонку БЛОК в листах после пересборки зависимостей
-    for f in files:
-        for sheet_name in ['СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']:
+    # Автогенерация зависимостей — только для проектов где были изменения
+    changed_files = [f for f in files if f.get('changed')]
+    if changed_files:
+        logger.info(f'Пересчёт зависимостей для {len(changed_files)} из {len(files)} проекта(ов)')
+        for f in changed_files:
             try:
-                _update_block_column(f['file_id'], sheet_name, f['project_name'])
+                _rebuild_element_dependencies(f['project_name'], f['file_id'])
             except Exception as e:
-                logger.warning(f'  БЛОК update after deps ({f["project_name"]}/{sheet_name}): {e}')
+                logger.error(f'  Зависимости rebuild error ({f["project_name"]}): {e}')
 
-    # Reconcile: снимаем БЛОК с задач, чьи зависимости выполнены
-    for f in files:
-        try:
-            _reconcile_blocks(f['project_name'])
-        except Exception as e:
-            logger.error(f'  Reconcile error ({f["project_name"]}): {e}')
+        # Обновляем КОЛОНКУ БЛОК только для изменённых проектов
+        for f in changed_files:
+            for sheet_name in ['СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']:
+                try:
+                    _update_block_column(f['file_id'], sheet_name, f['project_name'])
+                except Exception as e:
+                    logger.warning(f'  БЛОК update after deps ({f["project_name"]}/{sheet_name}): {e}')
+
+        # Reconcile: снимаем БЛОК с задач, чьи зависимости выполнены
+        for f in changed_files:
+            try:
+                _reconcile_blocks(f['project_name'])
+            except Exception as e:
+                logger.error(f'  Reconcile error ({f["project_name"]}): {e}')
+    else:
+        logger.info('Зависимости: изменений нет, пересчёт пропущен')
 
     if progress_cb:
         progress_cb('deps_done', {})
+
+    # Обновляем лист СОТРУДНИКИ во всех проектах из БД
+    for f in files:
+        try:
+            _sync_employees_sheet(f['file_id'], f['project_name'])
+            if f != files[-1]:
+                time.sleep(2)
+        except Exception as e:
+            logger.warning(f'  _sync_employees_sheet error ({f["project_name"]}): {e}')
 
     db.execute(
         "UPDATE work_orders SET mandatory=true WHERE status='ЧАСТИЧНО' AND (mandatory IS NULL OR mandatory=false)",
         []
     )
     logger.info(f'Sync done. Total: {total_synced} rows')
+    logger.info(f'  Обращений к Sheets API за проход: {_api_total()} {sheets.api_stats()}')
 
     if progress_cb:
         progress_cb('sync_done', {'total': total_synced})
@@ -844,4 +1253,18 @@ def run(progress_cb=None):
     return total_synced
 
 if __name__ == '__main__':
-    run()
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument('--project', type=int, default=None, help='id проекта (только он)')
+    _ap.add_argument('--force', action='store_true', help='не пропускать неизменённые листы')
+    _ap.add_argument('--progress-file', default=None, help='файл для построчного JSON-прогресса (для бота)')
+    _args = _ap.parse_args()
+    _cb = None
+    if _args.progress_file:
+        def _cb(phase, data, _pf=_args.progress_file):
+            try:
+                with open(_pf, 'a', encoding='utf-8') as _fh:
+                    _fh.write(_json_s.dumps({'phase': phase, 'data': data}, ensure_ascii=False, default=str) + '\n')
+            except Exception:
+                pass
+    run(progress_cb=_cb, only_project=_args.project, force=_args.force)
