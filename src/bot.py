@@ -1853,8 +1853,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Удаление таблицы из Drive
         drive_err = None
         try:
-            drive = _wiz._drive_oauth()
-            drive.files().delete(fileId=sheet_id, supportsAllDrives=True).execute()
+            drive = await _bg(_wiz._drive_oauth)
+            await _bg(drive.files().delete(fileId=sheet_id, supportsAllDrives=True).execute)
         except Exception as e:
             drive_err = str(e)
             logger.warning("Не удалось удалить Sheets файл %s: %s", sheet_id, e)
@@ -3222,6 +3222,12 @@ async def receive_block_comment(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+async def _bg(fn, *args, **kwargs):
+    """Тяжёлый синхронный вызов (Google Sheets/Drive, Excel) в потоке: цикл бота остаётся свободным для других пользователей."""
+    import functools
+    return await asyncio.get_running_loop().run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+
 async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 1: получаем ссылку на папку Drive, сканируем, показываем найденные специализации."""
     user = update.effective_user
@@ -3240,7 +3246,7 @@ async def receive_project_link(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = await update.message.reply_text("🔍 Сканирую папку Drive...")
 
     try:
-        scan = _wiz.scan_and_recognize(folder_id)
+        scan = await _bg(_wiz.scan_and_recognize, folder_id)
     except Exception as e:
         app_logger.alert(f"wizard scan error: {e}")
         await msg.edit_text(f"❌ Ошибка сканирования:\n{e}\n\nПроверьте доступ или /cancel.")
@@ -3447,7 +3453,7 @@ async def wizard_cut_drawings(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.message.edit_text('⏳ Нарезаю PDF на отдельные страницы...')
     try:
-        pos_map = _wiz.cut_pdf_drawings(drawings_id)
+        pos_map = await _bg(_wiz.cut_pdf_drawings, drawings_id)
     except Exception as e:
         app_logger.alert(f'cut_pdf_drawings error: {e}')
         await query.message.edit_text(f'❌ Ошибка при нарезке чертежей:\n{e}')
@@ -3459,7 +3465,7 @@ async def wizard_cut_drawings(update: Update, context: ContextTypes.DEFAULT_TYPE
         f'⏳ Привязываю к строкам таблицы...'
     )
     try:
-        linked = _wiz.link_drawings(sheet_id, drawings_id, active_specs)
+        linked = await _bg(_wiz.link_drawings, sheet_id, drawings_id, active_specs)
     except Exception as e:
         app_logger.alert(f'link_drawings after cut error: {e}')
         await query.message.edit_text(
@@ -3617,7 +3623,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     si = 0
     await _upd(si, si)
     try:
-        sheet_id = _wiz.create_spreadsheet(project_name, folder_id)
+        sheet_id = await _bg(_wiz.create_spreadsheet, project_name, folder_id)
     except Exception as e:
         app_logger.alert(f"wizard create_spreadsheet error: {e}")
         await _upd(si, si, err=si)
@@ -3650,7 +3656,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     si = 2
     await _upd(si, si)
     try:
-        _wiz.setup_sheet_tabs(sheet_id, active_specs)
+        await _bg(_wiz.setup_sheet_tabs, sheet_id, active_specs)
     except Exception as e:
         app_logger.alert(f"wizard setup_sheet_tabs error: {e}")
         await query.message.edit_text(f"❌ Ошибка при создании вкладок:\n{e}")
@@ -3660,7 +3666,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     si = 3
     await _upd(si, si)
     try:
-        _wiz.setup_service_tabs(sheet_id, active_specs)
+        await _bg(_wiz.setup_service_tabs, sheet_id, active_specs)
     except Exception as e:
         app_logger.alert(f"wizard setup_service_tabs error: {e}")
         await query.message.edit_text(f"❌ Ошибка при создании служебных вкладок:\n{e}")
@@ -3670,7 +3676,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     si = 4
     await _upd(si, si)
     try:
-        _wiz.fill_deps_sheet(sheet_id, active_specs)
+        await _bg(_wiz.fill_deps_sheet, sheet_id, active_specs)
     except Exception as e:
         app_logger.alert(f"wizard fill_deps_sheet error: {e}")
 
@@ -3704,7 +3710,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     _json_sm.dump(_rules_sm, _f_sm, ensure_ascii=False, indent=2)
             except Exception as _e_sm:
                 app_logger.warning(f'section_mapping save failed: {_e_sm}')
-        counts = _wiz.load_excel_data(sheet_id, source_map, reference_files=_ref_files, section_mapping=_sec_mapping)
+        counts = await _bg(_wiz.load_excel_data, sheet_id, source_map, reference_files=_ref_files, section_mapping=_sec_mapping)
     except Exception as e:
         import traceback; app_logger.alert("wizard load_excel_data error: " + str(e) + chr(10) + traceback.format_exc())
         return ConversationHandler.END
@@ -3713,7 +3719,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     si = 6
     await _upd(si, si)
     try:
-        _wiz.add_data_validations(sheet_id, active_specs, counts)
+        await _bg(_wiz.add_data_validations, sheet_id, active_specs, counts)
     except Exception as e:
         app_logger.alert(f"wizard add_data_validations error: {e}")
 
@@ -3723,7 +3729,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     drawings_id = context.user_data.get('wiz_drawings_id')
     if drawings_id:
         try:
-            link_count = _wiz.link_drawings(sheet_id, drawings_id, active_specs)
+            link_count = await _bg(_wiz.link_drawings, sheet_id, drawings_id, active_specs)
             app_logger.info(f"wizard link_drawings: {link_count} ссылок привязано")
         except Exception as _le:
             app_logger.alert(f"wizard link_drawings error: {_le}")

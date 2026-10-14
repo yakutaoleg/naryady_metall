@@ -1136,6 +1136,7 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 )
             )
             hdrs = []
+            _sub_only = []   # подзаголовок без верхнего (r1) — запасной вариант, если «растянутый» заголовок не опознан
             n_cols = max(len(r1), len(r2), len(r3) if _r3_is_hdr else 0)
             for ci in range(n_cols):
                 c1 = str(r1[ci]).strip() if ci < len(r1) and r1[ci] is not None else ''
@@ -1143,9 +1144,11 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 c3 = str(r3[ci]).strip() if _r3_is_hdr and ci < len(r3) and r3[ci] is not None else ''
                 parts = [p for p in (c1, c2, c3) if p]
                 hdrs.append(' '.join(parts))
+                _sub_only.append(' '.join(p for p in (c2, c3) if p))
             ds = hdr_idx + 3 if _r3_is_hdr else hdr_idx + 2
         else:
             hdrs = [str(c).strip() if c is not None else '' for c in r1]
+            _sub_only = []
             ds = hdr_idx + 1
 
         if ds < len(rows) and all(c is None or str(c).strip() == '' for c in rows[ds]):
@@ -1171,6 +1174,15 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 _xh_nospace = xh.lower().replace(' ', '').replace('\n', '').replace('\t', '')
                 for _ck, _cv in col_mapping.items():
                     if _ck.lower().replace(' ', '') == _xh_nospace:
+                        mapped = _cv
+                        _skip_col = (_cv is None)
+                        break
+            if mapped is None and not _skip_col and xi < len(_sub_only) and _sub_only[xi] and _sub_only[xi] != xh:
+                # Верхний заголовок объединённой ячейки пуст, а растяжка взяла соседний («Длина (мм) элемента (кг)»):
+                # пробуем подзаголовок отдельно.
+                _so_l = _sub_only[xi].lower().replace(' ', '')
+                for _ck, _cv in col_mapping.items():
+                    if _ck.lower().replace(' ', '') == _so_l:
                         mapped = _cv
                         _skip_col = (_cv is None)
                         break

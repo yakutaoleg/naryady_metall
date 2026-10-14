@@ -39,3 +39,29 @@ def test_projects_keyboards_split_active_and_archive():
     arch = [{'id': 2, 'project_name': 'А', 'status': 'АРХИВ'}]
     kb2 = bot.projects_list_kb(arch, archive=True).inline_keyboard
     assert not any('Добавить' in b.text for r in kb2 for b in r)
+
+
+def test_bg_runs_in_thread_and_keeps_loop_free():
+    """Тяжёлый вызов мастера идёт в потоке: цикл бота успевает отвечать, пока он работает."""
+    import asyncio, threading, time
+
+    def slow():
+        time.sleep(0.5)
+        return threading.current_thread().name
+
+    async def scenario():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.05)
+                ticks += 1
+        t = asyncio.create_task(ticker())
+        name = await bot._bg(slow)
+        t.cancel()
+        return name, ticks
+
+    name, ticks = asyncio.run(scenario())
+    assert name != threading.main_thread().name
+    assert ticks >= 5            # цикл не был заблокирован

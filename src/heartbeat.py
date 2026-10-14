@@ -51,12 +51,12 @@ def collect(prev):
         problems['disk'] = f'Мало места на диске: свободно {du.free / du.total:.0%}'
 
     try:
-        size = os.path.getsize(FAULT_LOG)
+        fatal = open(FAULT_LOG, encoding='utf-8', errors='replace').read().count('Fatal Python error')
     except OSError:
-        size = 0
-    keep['fault_size'] = size
-    if prev.get('fault_size') is not None and size > prev['fault_size']:
-        problems['fault_log'] = 'В logs/faulthandler.log появилась новая запись (аварийное падение процесса)'
+        fatal = 0
+    keep['fatal_count'] = fatal
+    if prev.get('fatal_count') is not None and fatal > prev['fatal_count']:
+        problems['fault_log'] = 'В logs/faulthandler.log новое аварийное падение процесса (Fatal Python error)'
     return problems, keep
 
 
