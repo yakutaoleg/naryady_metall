@@ -493,10 +493,15 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
             logger.warning(f'  ЗАВИСИМОСТИ sheet error ({project_name}): {_ze}')
 
     # Читаем все листы одним batch-запросом (1 API call вместо 8)
-    _SHEET_RANGES = ['ПИЛА!A:Z', 'ПЛАЗМА!A:Z', 'СВЕРЛЕНИЕ!A:Z',
-                     'СБОРКА!A:Z', 'СВАРКА!A:Z', 'ГРУНТОВКА!A:Z', 'ПОКРАСКА!A:Z']
-    _batch_data: dict = {}
+    _ALL_NAMES = ['ПИЛА', 'ПЛАЗМА', 'СВЕРЛЕНИЕ', 'СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']
+    # Просим только существующие листы: у проекта без части вкладок запрос несуществующего листа даёт 400,
+    # откат на чтение по листам и десятки ошибок/запросов в сутки. Отсутствующий лист = пустые данные.
+    _exist_rb = set(_existing_sheets(project_name, file_id))
+    _SHEET_RANGES = [f'{n}!A:Z' for n in _ALL_NAMES if n in _exist_rb]
+    _batch_data: dict = {n: [] for n in _ALL_NAMES if n not in _exist_rb}
     try:
+        if not _SHEET_RANGES:
+            raise RuntimeError('в таблице нет ни одного рабочего листа')
         _gc_rb = sheets._gc(sheets.SCOPES_RO)
         _ss_rb = _gc_rb.open_by_key(file_id)
         _resp = sheets._api_call(
@@ -619,7 +624,10 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
     summary = ', '.join(f'{k}:{v}' for k, v in sorted(pair_counts.items()))
     logger.info(f'  Зависимости ({project_name}): {len(deps)} записей [{summary}]')
     if len(deps) == 0:
-        logger.error(f'  Зависимости ({project_name}): ВНИМАНИЕ — 0 записей, возможен сбой матчинга!')
+        if len(_exist_rb) < 2:
+            logger.info(f'  Зависимости ({project_name}): рабочих листов меньше двух — зависимостей быть не может')
+        else:
+            logger.error(f'  Зависимости ({project_name}): ВНИМАНИЕ — 0 записей, возможен сбой матчинга!')
 
 
 def _reconcile_blocks(project_name: str):
@@ -1213,7 +1221,10 @@ def run(progress_cb=None, only_project=None, force=False):
 
         # Обновляем КОЛОНКУ БЛОК только для изменённых проектов
         for f in changed_files:
+            _exist_blk = set(_existing_sheets(f['project_name'], f['file_id']))
             for sheet_name in ['СБОРКА', 'СВАРКА', 'ГРУНТОВКА', 'ПОКРАСКА']:
+                if sheet_name not in _exist_blk:
+                    continue          # у проекта нет такой вкладки: нечего обновлять, ошибка «лист не найден» не нужна
                 try:
                     _update_block_column(f['file_id'], sheet_name, f['project_name'])
                 except Exception as e:
