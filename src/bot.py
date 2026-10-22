@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 from src import config, db
 from src import project_wizard as _wiz, logger as app_logger
+from src import deps_parts
 from src.sheets import update_task_status
 from google.oauth2.service_account import Credentials as _SACredentials
 from googleapiclient.discovery import build as _gdrive_build
@@ -143,7 +144,7 @@ def get_active_tasks(worker_name: str, specialization: str = None):
     for t in tasks:
         if t['sheet_name'].upper() in SHEETS_WITH_DEPS:
             try:
-                t['deps_ready'] = _deps_ready(t['project_name'], t['element'], t['sheet_name'])
+                t['deps_ready'] = _deps_ready(t['project_name'], t['element'], t['sheet_name'], int(t['quantity'] or 0) or None)
                 if not t['deps_ready']:
                     t['deps_avail_qty'], _ = _deps_available_qty(
                         t['project_name'], t['element'], t['sheet_name'], int(t['quantity'] or 0)
@@ -160,10 +161,29 @@ def get_active_tasks(worker_name: str, specialization: str = None):
     return tasks
 
 
-def _deps_ready(project_name: str, element: str, sheet_name: str = None) -> bool:
+def _remaining_qty(project_name: str, sheet_name: str, element: str):
+    """Сколько штук элемента в листе ещё не выполнено (для расчёта по количеству деталей на сборку)."""
+    r = db.fetchone(
+        """SELECT COALESCE(SUM(quantity), 0) AS q FROM work_orders
+           WHERE project_name=%s AND sheet_name=%s AND element=%s AND status != 'ВЫПОЛНЕНО' AND row_num > 0""",
+        [project_name, sheet_name, element])
+    q = int(r['q'] or 0) if r else 0
+    return q if q > 0 else None
+
+
+def _deps_ready(project_name: str, element: str, sheet_name: str = None, own_qty: int = None) -> bool:
     """Возвращает True если все зависимости для элемента выполнены (или зависимостей нет)."""
     if not element:
         return True
+    _cov = set()
+    if sheet_name:
+        # Есть количество деталей на сборку (лист ЗАВИСИМОСТИ F/G): считаем по фактическому расходу
+        _pres = deps_parts.compute(project_name, sheet_name, element,
+                                   own_qty or _remaining_qty(project_name, sheet_name, element))
+        if _pres:
+            if _pres['blocked']:
+                return False
+            _cov = set(_pres['covered'])
     if sheet_name:
         deps = db.fetchall(
             """SELECT requires_sheet, requires_position FROM element_dependencies
@@ -179,6 +199,8 @@ def _deps_ready(project_name: str, element: str, sheet_name: str = None) -> bool
     if not deps:
         return True
     for dep in deps:
+        if dep['requires_sheet'] in _cov:
+            continue
         # Проверяем по element (не position): все строки с этим элементом в upstream листе
         rows = db.fetchall(
             """SELECT status, COALESCE(quantity, 0) as qty FROM work_orders
@@ -196,10 +218,18 @@ def _deps_ready(project_name: str, element: str, sheet_name: str = None) -> bool
     return True
 
 
-def _deps_blocking(project_name: str, element: str, sheet_name: str = None) -> list[str]:
+def _deps_blocking(project_name: str, element: str, sheet_name: str = None, own_qty: int = None) -> list[str]:
     """Возвращает список незакрытых зависимостей в виде читаемых строк."""
     if not element:
         return []
+    _cov, _lines = set(), []
+    if sheet_name:
+        _pres = deps_parts.compute(project_name, sheet_name, element,
+                                   own_qty or _remaining_qty(project_name, sheet_name, element))
+        if _pres:
+            _cov = set(_pres['covered'])
+            if _pres['blocked']:
+                _lines = deps_parts.blocking_lines(_pres)
     if sheet_name:
         deps = db.fetchall(
             """SELECT requires_sheet, requires_position FROM element_dependencies
@@ -212,8 +242,10 @@ def _deps_blocking(project_name: str, element: str, sheet_name: str = None) -> l
                WHERE project_name=%s AND element=%s""",
             [project_name, element]
         )
-    blocking = []
+    blocking = list(_lines)
     for dep in deps:
+        if dep['requires_sheet'] in _cov:
+            continue
         rows = db.fetchall(
             """SELECT status, COALESCE(quantity, 0) as qty FROM work_orders
                WHERE project_name=%s AND sheet_name=%s AND element=%s""",
@@ -241,8 +273,12 @@ def _deps_available_qty(project_name: str, element: str, sheet_name: str, task_q
     )
     if not deps:
         return (task_qty, task_qty)
+    _pres = deps_parts.compute(project_name, sheet_name, element, task_qty)
+    _cov = set(_pres['covered']) if _pres else set()
     min_ratio = 1.0
     for dep in deps:
+        if dep['requires_sheet'] in _cov:
+            continue
         rows = db.fetchall(
             """SELECT status, COALESCE(quantity, 0) as qty FROM work_orders
                WHERE project_name=%s AND sheet_name=%s AND element=%s""",
@@ -257,6 +293,8 @@ def _deps_available_qty(project_name: str, element: str, sheet_name: str, task_q
             if ratio < min_ratio:
                 min_ratio = ratio
     available = int(min_ratio * task_qty)
+    if _pres:
+        available = min(available, max(0, int(_pres['avail'])))
     return (available, task_qty)
 
 
@@ -1417,9 +1455,10 @@ def _available_qty_map(rows):
         own_done = float(own_row['done'] or 0)
         if own_total == 0:
             continue
+        _pres = deps_parts.compute(proj, sheet, lookup, int(own_total - own_done) or None)
         min_avail = own_total
         all_done = True
-        seen_sheets = set()
+        seen_sheets = set(_pres['covered']) if _pres else set()
         for d in deps:
             rs = d['requires_sheet']
             if rs in seen_sheets:
@@ -1442,10 +1481,14 @@ def _available_qty_map(rows):
                 avail_raw = _math_avq.floor(up_done * own_total / up_total)
                 if avail_raw < min_avail:
                     min_avail = avail_raw
-        if all_done:
+        if _pres and not _pres['blocked'] and all_done:
+            continue  # всё разблокировано — не переопределяем
+        if all_done and not _pres:
             continue  # всё разблокировано — не переопределяем
         # Доступно = avail_raw - уже выполнено в текущем листе
-        net = min_avail - own_done
+        net = (min_avail - own_done) if not all_done else float('inf')
+        if _pres:
+            net = min(net, float(_pres['avail']))
         if net < 0:
             net = 0
         result[(proj, sheet, lookup)] = net
@@ -3771,6 +3814,27 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as _de:
         app_logger.alert(f"wizard rebuild_deps error: {_de}")
 
+    # ── Количество деталей на сборку → лист ЗАВИСИМОСТИ (колонки F/G); после перезаписи листа выше ──────────────
+    comp_txt = ""
+    try:
+        from src import component_deps as _cd
+        _afiles = _cd.assembly_files_from_source_map(source_map)
+        if _afiles:
+            _crep = await _bg(_cd.fill_component_deps, sheet_id, _afiles)
+            app_logger.info(f"wizard component_deps: записано {_crep.get('written')} строк, сборок {_crep.get('assemblies')}, "
+                            f"нераспознанных деталей {len(_crep.get('unresolved', []))}, расхождений {len(_crep.get('mismatches', []))}")
+            _notes = []
+            for _spec_m, _pos_m, _have_m, _need_m, _kind_m in _crep.get('mismatches', [])[:5]:
+                _notes.append(f"  • {_spec_m}: {_pos_m} — в листе {_have_m:g}, нужно сборкам {_need_m:g} ({_kind_m})")
+            for _a_m, _p_m in _crep.get('unresolved', [])[:3]:
+                _notes.append(f"  • деталь {_p_m} (сборка {_a_m}) не найдена в листах ПЛАЗМА/ПИЛА")
+            if _crep.get('not_in_sheet'):
+                _notes.append(f"  • сборок из файла нет в листе СБОРКА: {len(_crep['not_in_sheet'])}")
+            if _notes:
+                comp_txt = "\n\n⚠️ Проверьте количество деталей на сборку:\n" + "\n".join(_notes).replace('_', ' ').replace('*', '').replace('`', '')
+    except Exception as _ce:
+        app_logger.alert(f"wizard component_deps error: {_ce}")
+
     # ── Последний шаг: активация (проект становится виден для sync) ────────────
     si = len(active_steps) - 1
     await _upd(si, si)
@@ -3802,7 +3866,7 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ *Проект создан!*\n\n"
         f"📁 {folder_name}\n"
         f"🔗 [Открыть таблицу]({sheet_url})\n\n"
-        f"Загружено:\n{rows_txt}{drawings_txt}\n\n"
+        f"Загружено:\n{rows_txt}{drawings_txt}{comp_txt}\n\n"
         f"Данные появятся у рабочих после следующей синхронизации (до 15 мин).",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🗂 К проектам", callback_data="projects"),

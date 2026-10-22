@@ -10,6 +10,9 @@ def _to_float(val):
 
 from src import sheets, db, logger, config
 
+from src import deps_parts
+
+
 def _parse_date(s):
     if not s: return None
     s = str(s).strip()
@@ -273,8 +276,10 @@ def _compute_block(project_name: str, sheet_name: str, position: str, element: s
     )
     if not deps:
         return ''
+    # Есть количество деталей на сборку (лист ЗАВИСИМОСТИ, колонки F/G) — эти листы считаем по фактическому расходу
+    _pres = deps_parts.compute(project_name, sheet_name, lookup, own_qty)
     blocked = []
-    seen_sheets = set()
+    seen_sheets = set(_pres['covered']) if _pres else set()
     for d in deps:
         if d['requires_sheet'] in seen_sheets:
             continue
@@ -340,6 +345,14 @@ def _compute_block(project_name: str, sheet_name: str, position: str, element: s
             blocked.append((d['requires_sheet'], min_avail_raw, total_elem))
         else:
             blocked.append((d['requires_sheet'], done_all, total_all))
+    if _pres and _pres['blocked']:
+        _total = int(own_qty) if own_qty else _pres['need']
+        _ls = []
+        for _rs, *_x in _pres['limiting']:
+            if _rs not in _ls:
+                _ls.append(_rs)
+        for _rs in sorted(_ls, key=lambda x: deps_parts.SHEET_ORDER.index(x) if x in deps_parts.SHEET_ORDER else 99):
+            blocked.append((_rs, _pres['avail'], _total))
     if not blocked:
         return '✅'
     parts = []
@@ -349,6 +362,12 @@ def _compute_block(project_name: str, sheet_name: str, position: str, element: s
         else:
             parts.append(f'⛔ {sheet}')
     return '\n'.join(parts)
+
+
+def _same_block(a, b) -> bool:
+    if a == b:
+        return True
+    return sorted(str(a or '').split('\n')) == sorted(str(b or '').split('\n'))
 
 
 def _update_block_column(file_id: str, sheet_name: str, project_name: str, rows: list[dict] = None,
@@ -416,8 +435,8 @@ def _update_block_column(file_id: str, sheet_name: str, project_name: str, rows:
 
         key = (r['position'] or r['element'] or '').strip()
         val = pos_block_val.get(key, '')
-        if row_id_col and current_block.get(sheet_row, None) == val:
-            continue   # в листе уже то же значение — запись не нужна
+        if row_id_col and _same_block(current_block.get(sheet_row, None), val):
+            continue   # в листе уже то же значение (с точностью до порядка строк) — запись не нужна
         updates.append({
             'range': f'{sheets._col_letter(block_col)}{sheet_row}',
             'values': [[val]]
@@ -462,7 +481,11 @@ def _upsert_employees(rows: list[dict], sheet_name: str):
 
 
 def _rebuild_element_dependencies(project_name: str, file_id: str):
-    """Синхронизирует element_dependencies из листа ЗАВИСИМОСТИ (если есть), иначе авто-генерирует."""
+    """Синхронизирует element_dependencies из листа ЗАВИСИМОСТИ (если есть), иначе авто-генерирует.
+    Строки с заполненными F «ДЕТАЛЬ» и G «КОЛ-ВО НА 1 СБОРКУ» — точная потребность в деталях (deps_parts);
+    они хранятся рядом с обычными строками и не заменяют их."""
+    part_rows = []     # (waiting, element, requires_sheet, tag, part, qty_per)
+    bad_parts = 0
 
     try:
         ws_z = sheets._ws(file_id, 'ЗАВИСИМОСТИ')
@@ -471,7 +494,17 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
             deps_from_sheet = []
             for row in z_data[1:]:
                 if len(row) >= 5 and row[1].strip() and row[2].strip() and row[3].strip() and row[4].strip():
+                    _part = row[5].strip() if len(row) > 5 else ''
+                    if _part:
+                        _q = deps_parts._num(row[6]) if len(row) > 6 else None
+                        if _q and _q > 0:
+                            part_rows.append((row[1].strip(), row[2].strip(), row[3].strip(), row[4].strip(), _part, _q))
+                        else:
+                            bad_parts += 1      # деталь указана, количество пустое или неверное: строку не учитываем
+                        continue
                     deps_from_sheet.append((row[1].strip(), row[2].strip(), row[3].strip(), row[4].strip()))
+            if bad_parts:
+                logger.warning(f'  Зависимости ({project_name}): строк с деталью без верного количества: {bad_parts}')
             if deps_from_sheet:
                 with db.transaction() as conn:
                     with conn.cursor() as cur:
@@ -483,10 +516,18 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
                                 "VALUES (%s,%s,%s,%s,%s)",
                                 [project_name, w, e, r, p]
                             )
+                        for w, e, r, p, part, q in part_rows:
+                            cur.execute(
+                                "INSERT INTO element_dependencies "
+                                "(project_name, waiting_sheet, element, requires_sheet, requires_position, part, qty_per) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                                [project_name, w, e, r, p, part, q]
+                            )
                 from collections import Counter
                 pair_counts = Counter(f'{r}->{w}' for w, e, r, p in deps_from_sheet)
                 summary = ', '.join(f'{k}:{v}' for k, v in sorted(pair_counts.items()))
-                logger.info(f'  Зависимости ({project_name}): {len(deps_from_sheet)} записей [{summary}]')
+                logger.info(f'  Зависимости ({project_name}): {len(deps_from_sheet)} записей [{summary}]'
+                            + (f', с количеством деталей: {len(part_rows)}' if part_rows else ''))
                 return
     except Exception as _ze:
         if 'WorksheetNotFound' not in str(type(_ze)) and 'not found' not in str(_ze).lower():
@@ -620,6 +661,13 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
                        VALUES (%s, %s, %s, %s, %s)""",
                     [project_name, w, e, r, p]
                 )
+            for w, e, r, p, part, q in part_rows:
+                cur.execute(
+                    """INSERT INTO element_dependencies
+                       (project_name, waiting_sheet, element, requires_sheet, requires_position, part, qty_per)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    [project_name, w, e, r, p, part, q]
+                )
 
     summary = ', '.join(f'{k}:{v}' for k, v in sorted(pair_counts.items()))
     logger.info(f'  Зависимости ({project_name}): {len(deps)} записей [{summary}]')
@@ -633,7 +681,7 @@ def _rebuild_element_dependencies(project_name: str, file_id: str):
 def _reconcile_blocks(project_name: str):
     """Снимает БЛОК с задач, чьи зависимости уже выполнены."""
     blocked = db.fetchall(
-        """SELECT wo.id, wo.element, wo.position, wo.sheet_name, wo.file_id, wo.row_num
+        """SELECT wo.id, wo.element, wo.position, wo.sheet_name, wo.file_id, wo.row_num, wo.quantity
            FROM work_orders wo
            WHERE wo.project_name=%s AND wo.status='БЛОК'
              AND (wo.comment IS NULL OR wo.comment = '')
@@ -654,7 +702,13 @@ def _reconcile_blocks(project_name: str):
             [project_name, task['sheet_name'], lookup]
         )
         all_done = True
+        _pres = deps_parts.compute(project_name, task['sheet_name'], lookup, int(task.get('quantity') or 0) or None)
+        _cov = set(_pres['covered']) if _pres else set()
+        if _pres and _pres['blocked']:
+            all_done = False
         for dep in deps:
+            if dep['requires_sheet'] in _cov:
+                continue
             pending = db.fetchone(
                 """SELECT COALESCE(SUM(quantity), 0) as qty_pending FROM work_orders
                    WHERE project_name=%s AND sheet_name=%s

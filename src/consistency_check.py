@@ -86,6 +86,60 @@ def compare(p, data, employees):
     return found
 
 
+def check_components(warning, active_names):
+    """Проверка заполнения количества деталей на сборку (лист ЗАВИСИМОСТИ, колонки F/G) для проектов, где оно есть."""
+    for pr in db.fetchall("SELECT DISTINCT project_name FROM element_dependencies WHERE part IS NOT NULL", []):
+        pn = pr['project_name']
+        if pn not in active_names:
+            continue
+        # 1) деталь из зависимостей отсутствует в листе-источнике
+        miss = db.fetchall(
+            "SELECT DISTINCT ed.requires_sheet, ed.part FROM element_dependencies ed WHERE ed.project_name=%s AND ed.part IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM work_orders w WHERE w.project_name=ed.project_name AND w.sheet_name=ed.requires_sheet "
+            "AND lower(trim(w.position))=lower(trim(ed.part)))", [pn])
+        for r in miss:
+            warning['деталь из зависимостей не найдена в листе'].append((pn, f"{r['requires_sheet']}: {r['part']}"))
+        # 2) сборки без количества деталей
+        nop = db.fetchall(
+            "SELECT DISTINCT w.element FROM work_orders w WHERE w.project_name=%s AND w.sheet_name='СБОРКА' AND w.row_num>0 "
+            "AND w.element IS NOT NULL AND upper(w.element)<>'ИТОГО' AND NOT EXISTS (SELECT 1 FROM element_dependencies ed "
+            "WHERE ed.project_name=w.project_name AND ed.waiting_sheet='СБОРКА' AND ed.element=w.element AND ed.part IS NOT NULL)", [pn])
+        if nop:
+            warning['у сборки нет количества деталей'].append((pn, ', '.join(r['element'] for r in nop[:6]) + (f' … всего {len(nop)}' if len(nop) > 6 else '')))
+        # 3) дубли строк (деталь указана дважды для одной сборки)
+        dup = db.fetchall(
+            "SELECT element, requires_sheet, part, count(*) c FROM element_dependencies WHERE project_name=%s AND part IS NOT NULL "
+            "GROUP BY 1,2,3 HAVING count(*) > 1", [pn])
+        for r in dup:
+            warning['дубли строк с деталью в зависимостях'].append((pn, f"{r['element']}: {r['part']} ×{r['c']}"))
+        # 4) нужно сборкам больше, чем заложено в листе деталей («готовый элемент» избытком не считаем)
+        need = db.fetchall(
+            "SELECT ed.requires_sheet rs, lower(trim(ed.part)) p, SUM(ed.qty_per * COALESCE(a.q, 0)) need "
+            "FROM element_dependencies ed LEFT JOIN (SELECT element, SUM(quantity) q FROM work_orders "
+            "WHERE project_name=%s AND sheet_name='СБОРКА' AND row_num>0 GROUP BY element) a ON a.element=ed.element "
+            "WHERE ed.project_name=%s AND ed.waiting_sheet='СБОРКА' AND ed.part IS NOT NULL GROUP BY 1,2", [pn, pn])
+        for r in need:
+            h = db.fetchone(
+                "SELECT COALESCE(SUM(quantity),0) have, COALESCE(SUM(quantity) FILTER (WHERE status='ВЫПОЛНЕНО'),0) done "
+                "FROM work_orders WHERE project_name=%s AND sheet_name=%s AND lower(trim(position))=%s", [pn, r['rs'], r['p']])
+            have, done, nd = float(h['have']), float(h['done']), float(r['need'])
+            if have and have < nd - 0.01:
+                warning['деталей в листе меньше, чем нужно сборкам'].append((pn, f"{r['rs']}: {r['p']} — в листе {have:g}, нужно {nd:g}"))
+        # 5) собрано больше, чем изготовлено деталей
+        over = db.fetchall(
+            "SELECT ed.requires_sheet rs, lower(trim(ed.part)) p, SUM(ed.qty_per * COALESCE(d.q, 0)) used "
+            "FROM element_dependencies ed LEFT JOIN (SELECT element, SUM(quantity) q FROM work_orders WHERE project_name=%s "
+            "AND sheet_name='СБОРКА' AND row_num>0 AND status='ВЫПОЛНЕНО' GROUP BY element) d ON d.element=ed.element "
+            "WHERE ed.project_name=%s AND ed.waiting_sheet='СБОРКА' AND ed.part IS NOT NULL GROUP BY 1,2", [pn, pn])
+        for r in over:
+            h = db.fetchone(
+                "SELECT COALESCE(SUM(quantity) FILTER (WHERE status='ВЫПОЛНЕНО'),0) done, COALESCE(SUM(quantity),0) have "
+                "FROM work_orders WHERE project_name=%s AND sheet_name=%s AND lower(trim(position))=%s", [pn, r['rs'], r['p']])
+            if float(h['have']) and float(r['used']) > float(h['done']) + 0.01:
+                warning['собрано больше, чем изготовлено деталей'].append(
+                    (pn, f"{r['rs']}: {r['p']} — собрано на {float(r['used']):g}, изготовлено {float(h['done']):g}"))
+
+
 def main():
     t_start = time.time()
     projects = db.fetchall("SELECT id, project_name, sheet_id FROM projects WHERE status='АКТИВНЫЙ' ORDER BY id", [])
@@ -158,6 +212,11 @@ def main():
             "SELECT project_name, last_synced_at FROM projects WHERE status='АКТИВНЫЙ' "
             "AND (last_synced_at IS NULL OR last_synced_at < now() - interval '45 minutes')", []):
         critical['синк давно не обновлял проект (>45 мин)'].append((r['project_name'], str(r['last_synced_at'])[:16]))
+
+    try:
+        check_components(warning, {p['project_name'] for p in projects})
+    except Exception as e:
+        warning['проверка деталей на сборку не выполнена'].append(('', str(e)[:80]))
 
     # ── сервисы ───────────────────────────────────────────────────────────────────
     sync_failed = subprocess.run(['systemctl', 'is-failed', '--quiet', 'naryady-sync-prod.service']).returncode == 0
