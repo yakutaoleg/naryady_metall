@@ -354,7 +354,7 @@ def recognize_excel(file_id: str, filename: str, mime: str = '') -> list[str]:
             if result_specs == ['ПЛАЗМА'] and section_values:
                 import re as _re_mix3
                 _PILA_RE3 = _re_mix3.compile(
-                    r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г)',
+                    r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г|КРУГ|ШГР)',
                     _re_mix3.IGNORECASE
                 )
                 if any(_PILA_RE3.match(v) for v in section_values[:40]):
@@ -389,7 +389,7 @@ def recognize_excel(file_id: str, filename: str, mime: str = '') -> list[str]:
     # Смешанные КМД «элементы»: если есть и пластины (ПЛАЗМА) и профили (ПИЛА) — вернуть оба
     import re as _re_mix2
     _PILA_RE2 = _re_mix2.compile(
-        r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г)',
+        r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г|КРУГ|ШГР)',
         _re_mix2.IGNORECASE
     )
     _has_plate2   = any('пластина' in v.lower() or 'лист' in v.lower() for v in section_values[:40])
@@ -588,7 +588,7 @@ def detect_unknown_sections(source_map: list) -> dict:
     import re as _re_unk
     PLATE_RE   = _re_unk.compile(r'пластина|лист', _re_unk.IGNORECASE)
     PROFILE_RE = _re_unk.compile(
-        r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г)', _re_unk.IGNORECASE
+        r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г|КРУГ|ШГР)', _re_unk.IGNORECASE
     )
 
     unknown: dict = {}
@@ -1379,7 +1379,7 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                     if _sec_val:
                         _is_plate   = 'пластина' in _sec_val.lower() or 'лист' in _sec_val.lower()
                         _is_profile = bool(_re_sec.match(
-                            r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г)',
+                            r'^(L |T |ШП |ПВ|Пр |Двутавр|ДБ |ДШ |ДК |Швеллер|Уголок|Труба|Тг|Tг|T_г|КРУГ|ШГР)',
                             _sec_val, _re_sec.IGNORECASE
                         ))
                         _sec_mapped = (section_mapping or {}).get(_sec_val)

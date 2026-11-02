@@ -3856,6 +3856,10 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as _se:
             app_logger.alert(f"wizard post-create sync error: {_se}")
     asyncio.ensure_future(_bg_sync())
+    # Сечения, которые мастер отправил в «Пропустить»: их позиций в нарядах не будет, об этом пишем явно
+    _skipped = [k for k, v in (context.user_data.get('wiz_section_mapping') or {}).items() if v == 'ПРОПУСТИТЬ']
+    if _skipped:
+        comp_txt += "\n\n⚠️ Пропущены сечения (их позиций в нарядах нет): " + ", ".join(_skipped).replace('_', ' ').replace('*', '').replace('`', '')
     # Итоговое сообщение
     rows_txt = "\n".join(f"  • {spec}: {cnt} строк" for spec, cnt in counts.items()) if counts else "  (нет данных)"
     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
