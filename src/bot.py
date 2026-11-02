@@ -3865,6 +3865,12 @@ async def _wizard_do_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
 
     drawings_txt = ""
+    if drawings_id:
+        # сколько позиций деталей (пила/плазма/сверление) получили ссылку на чертёж: остальные будут без чертежа
+        _detail_rows = sum(int(v or 0) for k, v in (counts or {}).items() if k in ('ПИЛА', 'ПЛАЗМА', 'СВЕРЛЕНИЕ'))
+        if _detail_rows:
+            drawings_txt = f"\n🖼 Чертежи привязаны к {link_count} из {_detail_rows} позиций" + (
+                f" (без чертежа: {max(_detail_rows - link_count, 0)})" if _detail_rows > link_count else "")
 
     await query.message.edit_text(
         f"✅ *Проект создан!*\n\n"
