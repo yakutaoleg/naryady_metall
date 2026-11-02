@@ -106,6 +106,11 @@ def bg_hex(color):
     return '%02X%02X%02X' % (r, g, b)
 
 
+def gspread_a1(row, col):
+    from gspread.utils import rowcol_to_a1
+    return rowcol_to_a1(row, col)
+
+
 def is_date(val):
     for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%m/%d/%Y'):
         try:
@@ -292,6 +297,7 @@ def check_sheet(sheet_name, cfg, file_id=None, project_name="", ss=None):
     qty_col      = col_map.get('КОЛ-ВО') or col_map.get('Кол-во')
     pos_col      = col_map.get('ПОЗ. СОГЛАСНО ЧЕРТЕЖА') or col_map.get('Марка')
 
+    date_fixes = []
     for idx in range(2, data_end):
         cells     = all_rows[idx].get('values', [])
         sheet_row = idx + 1
@@ -363,6 +369,10 @@ def check_sheet(sheet_name, cfg, file_id=None, project_name="", ss=None):
         for cn in ('ДАТА ПЛАН', 'ДАТА ФАКТ'):
             val = cv(col_map.get(cn))
             if val and not is_date(val):
+                _fixed = val.replace(',', '.')
+                if _fixed != val and is_date(_fixed) and col_map.get(cn):
+                    date_fixes.append((sheet_row, col_map[cn], _fixed, ref + ' «' + cn + '»: ' + val + ' → ' + _fixed))
+                    continue
                 issues.append('ТИП_ДАННЫХ | ' + ref + ' «' + cn + '»: ожидается дата, получено «' + val + '»')
 
         # Правило: ЧАСТИЧНО без ВЫПОЛНЕНО
@@ -379,6 +389,18 @@ def check_sheet(sheet_name, cfg, file_id=None, project_name="", ss=None):
         # Единственный реальный признак ошибки: в ИТОГО-строке есть БЛОК-значение
         # (проверяется отдельным правилом ИТОГО_БЛОК выше)
         # Остальные правила по БЛОК-колонке сняты — логика теперь dependency-based
+
+    # Автоисправление: дата с запятой вместо точки («01,11,2026» → «01.11.2026»)
+    if date_fixes:
+        try:
+            ws_rw = sh._gc(sh.SCOPES_RW).open_by_key(file_id or FILE_ID).worksheet(sheet_name)
+            for r, c, v, msg in date_fixes:
+                ws_rw.update([[v]], gspread_a1(r, c), value_input_option='USER_ENTERED')
+                print(f'[MONITOR] {_ts()}   автоисправление даты: {msg}', flush=True)
+        except Exception as e:
+            print(f'[MONITOR] {_ts()}   автоисправление не удалось: {e}', flush=True)
+            for _r, _c, _v, msg in date_fixes:
+                issues.append('ТИП_ДАННЫХ | ' + msg)
 
     return issues
 
