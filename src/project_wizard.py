@@ -1057,6 +1057,77 @@ def _add_itogo_rows(sheet_id: str, tasks: list[dict]) -> None:
         ))
 
 
+def collect_pos_assemblies(parsed_files: list) -> dict:
+    """Разведка по ВСЕМ исходным файлам сразу: позиция -> список сборок, в которые она входит.
+    parsed_files = [(data_rows, xl_to_sheet), ...]. Порядок файлов не влияет на результат.
+    Сборка = заголовок-группа «Поз.=Б1 Количество=2 ...» (или «<имя> Количество=N»); детали идут под ней."""
+    import re
+    result: dict = {}
+    for data_rows, xl_to_sheet in parsed_files:
+        pk_xi = next((xi for xi, n in xl_to_sheet.items()
+                      if n in ('ПОЗ. СОГЛАСНО ЧЕРТЕЖА', 'Марка', 'ЭЛЕМЕНТ')), None)
+        if pk_xi is None:
+            continue
+        group = None
+        for row in data_rows:
+            vals = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if not vals:
+                continue
+            low0 = vals[0].lower()
+            if low0.startswith(('итог', 'добавление массы', 'общая масса', 'общий вес')):
+                continue
+            c0 = str(row[0]).strip() if row and row[0] is not None else ''
+            if low0.startswith('поз.='):
+                m = re.match(r'(?i)поз[.\s]*=\s*(\S+)', c0)
+                if m:
+                    group = m.group(1).strip()
+                continue
+            if re.search(r'(?i)количество\s*=\s*\d', c0):
+                m = re.match(r'^(.*?)\s+[Кк]оличество\s*=', c0)
+                group = (m.group(1).rstrip('. ').strip() if m else c0)
+                continue
+            if group is None or pk_xi >= len(row) or row[pk_xi] is None:
+                continue
+            pos = str(row[pk_xi]).strip()
+            if not pos:
+                continue
+            lst = result.setdefault(pos.lower(), [])
+            if group not in lst:
+                lst.append(group)
+    return result
+
+
+def fill_empty_elements(ss, pos_asm: dict, specs=('ПИЛА', 'ПЛАЗМА', 'СВЕРЛЕНИЕ')) -> dict:
+    """Дописывает ЭЛЕМЕНТ (сборки через запятую) в пустые ячейки листов; уже заполненное не трогает."""
+    done = {}
+    for spec in specs:
+        try:
+            ws = ss.worksheet(spec)
+        except Exception:
+            continue
+        vals = ws.get_all_values()
+        if len(vals) < 3:
+            continue
+        hdr = vals[1]
+        ci_pos = next((i for i, h in enumerate(hdr) if h == 'ПОЗ. СОГЛАСНО ЧЕРТЕЖА'), None)
+        ci_el = next((i for i, h in enumerate(hdr) if h == 'ЭЛЕМЕНТ'), None)
+        if ci_pos is None or ci_el is None:
+            continue
+        col = [[(r[ci_el] if ci_el < len(r) else '')] for r in vals[2:]]
+        changed = 0
+        for k, r in enumerate(vals[2:]):
+            pos = (r[ci_pos] if ci_pos < len(r) else '').strip().lower()
+            if pos and pos != 'итого' and not col[k][0].strip() and pos in pos_asm:
+                col[k][0] = ', '.join(pos_asm[pos])
+                changed += 1
+        if changed:
+            from gspread.utils import rowcol_to_a1
+            rng = f'{rowcol_to_a1(3, ci_el + 1)}:{rowcol_to_a1(2 + len(col), ci_el + 1)}'
+            sheets._wapi_call(ws.update, col, range_name=rng, value_input_option='USER_ENTERED')
+        done[spec] = changed
+    return done
+
+
 def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list = None, section_mapping: dict = None) -> dict:
     """
     Загружает данные из source_map в соответствующие вкладки + добавляет ИТОГО.
@@ -1869,6 +1940,25 @@ def load_excel_data(sheet_id: str, source_map: list[dict], reference_files: list
                 log.info(f'load_excel_data: СВЕРЛЕНИЕ <- {len(sv_rows_to_write)} строк из отверстий')
         except Exception as _sv_e:
             log.warning(f'load_excel_data: СВЕРЛЕНИЕ из отверстий не записано: {_sv_e}')
+
+    # ЭЛЕМЕНТ по всем файлам сразу: не зависит от порядка файлов (плоские профили/пластины + сборочный)
+    try:
+        _parsed_all, _seen_ids = [], set()
+        for _it in source_map:
+            for _en in _it.get('entries', []):
+                if not _en.get('active', True) or _en['file']['id'] in _seen_ids:
+                    continue
+                _seen_ids.add(_en['file']['id'])
+                try:
+                    _parsed_all.append(_parse(_en['file']))
+                except Exception:
+                    pass
+        _pos_asm = collect_pos_assemblies(_parsed_all)
+        if _pos_asm:
+            _fe = fill_empty_elements(ss, _pos_asm)
+            log.info(f'load_excel_data: ЭЛЕМЕНТ из сборок дописан: {_fe}')
+    except Exception as _fe_e:
+        log.warning(f'load_excel_data: ЭЛЕМЕНТ из сборок не дописан: {_fe_e}')
 
     return stats
 
